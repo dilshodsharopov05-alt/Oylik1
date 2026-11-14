@@ -34,7 +34,7 @@ logging.basicConfig(
 # --- SOZLAMALAR ---
 TELEGRAM_TOKEN = os.environ.get("BOT_TOKEN", "9119787790:AAHxlNGWuDqdxmOc5478GxMt-XxGx0yWOCI")
 PORT = int(os.environ.get("PORT", 8080))
-ADMIN_ID = 1264738478
+ADMIN_IDS = [1264738478, 7090331311]  # 1-Admin (Dilshodbek) va 2-Admin (Anvar)
 FIREBASE_URL = "https://ishchilar-oyligi-default-rtdb.asia-southeast1.firebasedatabase.app"
 WEBAPP_URL = "https://dilshodsharopov05-alt.github.io/Oylik-bot/"
 
@@ -429,7 +429,7 @@ def format_carryover_line(carry):
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = update.effective_user.id
-    if user_id == ADMIN_ID:
+    if user_id in ADMIN_IDS:
         workers = get_all_workers()
         active_cnt = sum(1 for w in workers if not w[4])
         paused_cnt = sum(1 for w in workers if w[4])
@@ -522,7 +522,7 @@ async def check_worker_stats(update: Update, context: ContextTypes.DEFAULT_TYPE)
 
 
 async def start_edit_salary(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if update.effective_user.id != ADMIN_ID:
+    if update.effective_user.id not in ADMIN_IDS:
         return ConversationHandler.END
     workers = get_all_workers()
     if not workers:
@@ -621,7 +621,7 @@ def build_pause_keyboard():
 
 
 async def pause_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if update.effective_user.id != ADMIN_ID:
+    if update.effective_user.id not in ADMIN_IDS:
         return
     workers = get_all_workers()
     if not workers:
@@ -646,7 +646,7 @@ async def handle_pause_callback(
     update: Update, context: ContextTypes.DEFAULT_TYPE
 ):
     query = update.callback_query
-    if query.from_user.id != ADMIN_ID:
+    if query.from_user.id not in ADMIN_IDS:
         return
     await query.answer()
 
@@ -693,7 +693,7 @@ async def handle_pause_callback(
 
 
 async def start_add_worker(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if update.effective_user.id != ADMIN_ID:
+    if update.effective_user.id not in ADMIN_IDS:
         return ConversationHandler.END
     await update.message.reply_text("Yangi ishchining ism-familiyasini kiriting:")
     return ADD_NAME
@@ -730,7 +730,7 @@ async def get_worker_salary(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 async def start_del_worker(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if update.effective_user.id != ADMIN_ID:
+    if update.effective_user.id not in ADMIN_IDS:
         return ConversationHandler.END
     await update.message.reply_text(
         "O'chirmoqchi bo'lgan ishchining 7 xonali ID kodini kiriting:"
@@ -754,7 +754,7 @@ async def finish_del_worker(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 async def start_transaction(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if update.effective_user.id != ADMIN_ID:
+    if update.effective_user.id not in ADMIN_IDS:
         return ConversationHandler.END
     workers = get_all_workers()
     if not workers:
@@ -870,7 +870,7 @@ async def finish_transaction(update: Update, context: ContextTypes.DEFAULT_TYPE)
 async def distribute_salary_menu(
     update: Update, context: ContextTypes.DEFAULT_TYPE
 ):
-    if update.effective_user.id != ADMIN_ID:
+    if update.effective_user.id not in ADMIN_IDS:
         return
     workers = get_all_workers()
     if not workers:
@@ -977,7 +977,7 @@ async def handle_payout_callbacks(
     update: Update, context: ContextTypes.DEFAULT_TYPE
 ):
     query = update.callback_query
-    if query.from_user.id != ADMIN_ID:
+    if query.from_user.id not in ADMIN_IDS:
         return ConversationHandler.END
 
     await query.answer()
@@ -1074,7 +1074,7 @@ async def finish_partial_payout(update: Update, context: ContextTypes.DEFAULT_TY
 
 # --- ARXIV VA EXCEL EXPORT ---
 async def show_archive_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if update.effective_user.id != ADMIN_ID:
+    if update.effective_user.id not in ADMIN_IDS:
         return
 
     all_arch = get_archive_all()
@@ -1117,7 +1117,7 @@ async def show_archive_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 async def handle_archive_view(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
-    if query.from_user.id != ADMIN_ID:
+    if query.from_user.id not in ADMIN_IDS:
         return
     await query.answer()
 
@@ -1233,7 +1233,7 @@ async def handle_archive_view(update: Update, context: ContextTypes.DEFAULT_TYPE
 
 
 async def list_workers(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if update.effective_user.id != ADMIN_ID:
+    if update.effective_user.id not in ADMIN_IDS:
         return
     workers = get_all_workers()
     if not workers:
