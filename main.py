@@ -11,6 +11,7 @@ import requests
 from telegram import (
     InlineKeyboardButton,
     InlineKeyboardMarkup,
+    KeyboardButton,
     ReplyKeyboardMarkup,
     Update,
     WebAppInfo,
@@ -386,10 +387,10 @@ async def notify_worker(context: ContextTypes.DEFAULT_TYPE, tg_id, text):
 def get_admin_menu():
     buttons = [
         [
-            {
-                "text": "🌐 WebApp Ilovani ochish (Real-Time)",
-                "web_app": WebAppInfo(url=WEBAPP_URL),
-            }
+            KeyboardButton(
+                text="🌐 WebApp Ilovani ochish (Real-Time)",
+                web_app=WebAppInfo(url=WEBAPP_URL),
+            )
         ],
         ["➕ Ishchi qo'shish", "🗑 Ishchini o'chirish"],
         ["💸 Pul berish (Avans/Bonus)", "✏️ Stavkani tahrirlash"],
@@ -1260,7 +1261,6 @@ async def health_check(request):
 
 
 async def run_bot_and_server():
-    # 1. Veb-serverni ishga tushirish (Render portni ochiq deb ko'rishi va UptimeRobot pinglashi uchun)
     web_app = web.Application()
     web_app.router.add_get("/", health_check)
     web_app.router.add_get("/health", health_check)
@@ -1271,16 +1271,13 @@ async def run_bot_and_server():
     await site.start()
     logging.info(f"Aiohttp veb-server {PORT}-portda ishga tushdi.")
 
-    # 2. Telegram botni polling rejimida ishga tushirish
     bot_app = build_application()
     await bot_app.initialize()
     await bot_app.start()
-    # Agar avval webhook ulangan bo'lsa, uni o'chirib pollingni toza boshlaydi
     await bot_app.bot.delete_webhook(drop_pending_updates=True)
     await bot_app.updater.start_polling(allowed_updates=Update.ALL_TYPES)
     logging.info("Telegram bot polling rejimida ishga tushdi!")
 
-    # Dasturni doimiy ishlab turishini ta'minlash
     try:
         while True:
             await asyncio.sleep(3600)
