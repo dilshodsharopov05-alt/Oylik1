@@ -100,6 +100,7 @@ def add_worker(name, salary):
         "name": name,
         "id_code": code,
         "salary": salary,
+        "carryover_balance": 0,
         "start_date": today_str,
         "is_paused": False,
         "tg_user_id": None,
@@ -252,6 +253,7 @@ def get_worker_summary(id_code):
 
     name = w.get("name", "Nomsiz")
     base_salary = int(w.get("salary", 0))
+    carryover_balance = int(w.get("carryover_balance", 0))
     start_date_str = w.get("start_date")
     is_paused = bool(w.get("is_paused", False))
     tg_user_id = w.get("tg_user_id")
@@ -300,12 +302,13 @@ def get_worker_summary(id_code):
     total_taken = sum(t[0] for t in transactions if t[1] == "avans")
     total_bonus = sum(t[0] for t in transactions if t[1] == "bonus")
 
-    current_balance = (earned_salary_cur + total_bonus) - total_taken
-    full_payout_balance = (payout_earned_salary + total_bonus) - total_taken
+    current_balance = (carryover_balance + earned_salary_cur + total_bonus) - total_taken
+    full_payout_balance = (carryover_balance + payout_earned_salary + total_bonus) - total_taken
 
     return {
         "name": name,
         "base_salary": base_salary,
+        "carryover_balance": carryover_balance,
         "start_date": start_date_str or cur_month_start.strftime("%Y-%m-%d"),
         "is_paused": is_paused,
         "tg_user_id": tg_user_id,
@@ -326,14 +329,20 @@ def get_worker_summary(id_code):
     }
 
 
-def archive_worker_salary(id_code, note="Oylik tarqatildi"):
+def archive_worker_salary(id_code, paid_now):
     summary = get_worker_summary(id_code)
     if not summary:
         return None
 
-    paid = summary["full_payout_balance"]
+    next_carryover = summary["full_payout_balance"] - paid_now
     period, _, _, _ = get_payout_period_info()
     now_str = datetime.now().strftime("%Y-%m-%d %H:%M")
+
+    note_text = f"Oylik ({summary['worked_days_payout']} kun ishladi)"
+    if next_carryover > 0:
+        note_text += f" | Jamg'armaga o'tdi: +{next_carryover:,}"
+    elif next_carryover < 0:
+        note_text += f" | Keyingi oyga qarz: -{abs(next_carryover):,}"
 
     fb_post(
         "salary_archive",
@@ -341,11 +350,13 @@ def archive_worker_salary(id_code, note="Oylik tarqatildi"):
             "worker_id_code": id_code,
             "worker_name": summary["name"],
             "base_salary": summary["base_salary"],
+            "prev_carryover": summary["carryover_balance"],
             "total_bonus": summary["total_bonus"],
             "total_taken": summary["total_taken"],
-            "paid_amount": paid,
+            "paid_amount": paid_now,
+            "next_carryover": next_carryover,
             "period_month": period,
-            "note": note,
+            "note": note_text,
             "paid_date": now_str,
         },
     )
@@ -353,7 +364,9 @@ def archive_worker_salary(id_code, note="Oylik tarqatildi"):
     for _, _, _, _, r_key in summary["transactions"]:
         fb_patch(f"reports/{r_key}", {"is_archived": True})
 
-    return summary["name"], paid, summary["tg_user_id"]
+    fb_patch(f"workers/{id_code}", {"carryover_balance": next_carryover})
+
+    return summary["name"], paid_now, next_carryover, summary["tg_user_id"], summary["worked_days_payout"]
 
 
 def get_archive_all():
@@ -381,7 +394,8 @@ async def notify_worker(context: ContextTypes.DEFAULT_TYPE, tg_id, text):
     TRANS_NOTE,
     WORKER_CHECK_ID,
     EDIT_SAL_AMOUNT,
-) = range(8)
+    PARTIAL_PAY_AMOUNT,
+) = range(9)
 
 
 def get_admin_menu():
@@ -403,6 +417,14 @@ def get_admin_menu():
 WORKER_MENU = ReplyKeyboardMarkup(
     [["🔍 Hisobimni tekshirish"]], resize_keyboard=True
 )
+
+
+def format_carryover_line(carry):
+    if carry > 0:
+        return f"📦 **O'tgan oydan jamg'arma:** +{carry:,} so'm\n"
+    elif carry < 0:
+        return f"⚠️ **O'tgan oydan qarz:** -{abs(carry):,} so'm\n"
+    return ""
 
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -460,21 +482,24 @@ async def check_worker_stats(update: Update, context: ContextTypes.DEFAULT_TYPE)
         else "🟢 ISHLAMOQDA"
     )
     status = (
-        f"✅ Bugungi kunga sof qoldiq: {data['current_balance']:,} so'm"
+        f"✅ Bugungi kunga jami sof qoldiq: {data['current_balance']:,} so'm"
         if data["current_balance"] >= 0
-        else f"⚠️ Ortiqcha olingan (qarz): {abs(data['current_balance']):,} so'm"
+        else f"⚠️ Ortiqcha olingan (jami qarz): {abs(data['current_balance']):,} so'm"
     )
 
     msg = ""
     if newly_bound:
         msg += "🔔 _Telegram hisobingiz ushbu ID ga ulandi! Endi barcha o'zgarishlar haqida avtomatik xabar olasiz._\n\n"
 
+    carry_line = format_carryover_line(data["carryover_balance"])
+
     msg += (
         f"👤 **Xodim:** {data['name']}\n"
         f"📌 **Holati:** {holat_badge}\n"
         f"📅 **Ish boshlagan sana:** `{data['start_date']}`\n"
         f"💰 **1 oylik stavka (100%):** {data['base_salary']:,} so'm\n"
-        f"📈 **Ishlagan kunlari ({data['worked_days_cur']} kun, pauza: {data['paused_days_cur']} kun — {data['percent_cur']}%):** {data['earned_salary_cur']:,} so'm\n"
+        f"{carry_line}"
+        f"📈 **Shu oyda ishlagan kunlari ({data['worked_days_cur']} kun, pauza: {data['paused_days_cur']} kun — {data['percent_cur']}%):** {data['earned_salary_cur']:,} so'm\n"
         f"🎁 **Bonuslar:** {data['total_bonus']:,} so'm\n"
         f"💸 **Olingan pullar (avans):** {data['total_taken']:,} so'm\n"
         f"━━━━━━━━━━━━━━\n"
@@ -829,7 +854,7 @@ async def finish_transaction(update: Update, context: ContextTypes.DEFAULT_TYPE)
         f"📌 Turi: **{label_uz}**\n"
         f"💵 Summa: **{amount:,} so'm**{note_line}\n"
         f"━━━━━━━━━━━━━━\n"
-        f"💰 Bugungi kunga sof qoldiq: **{updated_summary['current_balance']:,} so'm**",
+        f"💰 Bugungi kunga jami sof qoldiq: **{updated_summary['current_balance']:,} so'm**",
     )
 
     await update.message.reply_text(
@@ -841,6 +866,7 @@ async def finish_transaction(update: Update, context: ContextTypes.DEFAULT_TYPE)
     return ConversationHandler.END
 
 
+# --- OYLIK TARQATISH (TO'LIQ YOKI QISMAN/JAMG'ARMA/QARZ BILAN) ---
 async def distribute_salary_menu(
     update: Update, context: ContextTypes.DEFAULT_TYPE
 ):
@@ -865,19 +891,26 @@ async def distribute_salary_menu(
         bal = s["full_payout_balance"]
         if bal > 0:
             total_payout += bal
+
+        carry_str = ""
+        if s["carryover_balance"] > 0:
+            carry_str = f" | Jamg'arma: +{s['carryover_balance']:,}"
+        elif s["carryover_balance"] < 0:
+            carry_str = f" | O'tgan qarz: -{abs(s['carryover_balance']):,}"
+
         holat = (
-            f"✅ Qo'liga tegadi: {bal:,} so'm"
+            f"✅ Jami sof balans: +{bal:,} so'm"
             if bal >= 0
-            else f"⚠️ Qarzi bor: {abs(bal):,} so'm"
+            else f"⚠️ Qarzi bor: -{abs(bal):,} so'm"
         )
         msg += (
             f"👤 **{name}** (`{code}`)\n"
             f"   Ishladi: {s['worked_days_payout']}/{days_in_p} kun (Pauza: {s['paused_days_payout']} kun)\n"
-            f"   Hisoblandi: {s['payout_earned_salary']:,} | Bonus: {s['total_bonus']:,} | Olgan: {s['total_taken']:,}\n"
+            f"   Hisoblandi: {s['payout_earned_salary']:,} | Bonus: {s['total_bonus']:,} | Olgan: {s['total_taken']:,}{carry_str}\n"
             f"   👉 {holat}\n\n"
         )
 
-    msg += f"━━━━━━━━━━━━━━\n💰 **Jami tarqatiladigan summa:** {total_payout:,} so'm\n\n"
+    msg += f"━━━━━━━━━━━━━━\n💰 **Jami ijobiy balans:** {total_payout:,} so'm\n\n"
     msg += "Hisobotni tasdiqlaysizmi?"
 
     kb = InlineKeyboardMarkup(
@@ -901,18 +934,43 @@ def build_payout_workers_keyboard():
     for name, code, _, _, _, _ in workers:
         s = get_worker_summary(code)
         bal = s["full_payout_balance"]
-        buttons.append(
-            [
+        row = []
+        if bal > 0:
+            row.append(
                 InlineKeyboardButton(
-                    f"💵 {name} ({bal:,} so'm) — Berildi",
-                    callback_data=f"pay_one_{code}",
+                    f"💵 {name} ({bal:,}) — To'liq",
+                    callback_data=f"pay_full_{code}",
                 )
-            ]
+            )
+        row.append(
+            InlineKeyboardButton(
+                f"💰 {name} — Qisman / Jamg'arma",
+                callback_data=f"pay_part_{code}",
+            )
         )
+        buttons.append(row)
     buttons.append(
         [InlineKeyboardButton("🔙 Yopish", callback_data="cancel_payout")]
     )
     return InlineKeyboardMarkup(buttons)
+
+
+async def send_payout_notification(context, name, paid_now, next_carryover, tg_id, worked_days):
+    if next_carryover > 0:
+        extra_msg = f"📦 **Jamg'armaga (keyingi oyga) o'tkazildi:** +{next_carryover:,} so'm"
+    elif next_carryover < 0:
+        extra_msg = f"⚠️ **Keyingi oyga o'tgan qarz:** -{abs(next_carryover):,} so'm"
+    else:
+        extra_msg = "✅ Oy hisobi 0 balans bilan to'liq yopildi."
+
+    await notify_worker(
+        context,
+        tg_id,
+        f"🎉 **Oylik hisob-kitobi yopildi!**\n"
+        f"📅 Ishlangan vaqt: {worked_days} kun\n"
+        f"💵 Qo'lingizga berilgan summa: **{paid_now:,} so'm**\n"
+        f"{extra_msg}",
+    )
 
 
 async def handle_payout_callbacks(
@@ -920,52 +978,101 @@ async def handle_payout_callbacks(
 ):
     query = update.callback_query
     if query.from_user.id != ADMIN_ID:
-        return
+        return ConversationHandler.END
 
     await query.answer()
     data = query.data
 
     if data == "cancel_payout":
         await query.edit_message_text("❌ Oylik tarqatish oynasi yopildi.")
-        return
+        return ConversationHandler.END
 
     if data == "confirm_payout":
         kb = build_payout_workers_keyboard()
         await query.edit_message_text(
-            "💸 **Oylik berilgan ishchini tanlang:**\n_(Bosilganda shu kungacha bo'lgan barcha avanslari yopilib arxivga tushadi)_",
+            "💸 **Oylik tarqatish:**\n"
+            "• **To'liq** — barcha puli beriladi (qoldiq: 0)\n"
+            "• **Qisman / Jamg'arma** — qo'liga berilgan summani yozasiz, qolgani (yoki qarzi) keyingi oyga o'tadi:",
             parse_mode="Markdown",
             reply_markup=kb,
         )
-        return
+        return ConversationHandler.END
 
-    if data.startswith("pay_one_"):
-        code = data.replace("pay_one_", "")
+    if data.startswith("pay_full_"):
+        code = data.replace("pay_full_", "")
         s = get_worker_summary(code)
-        note_str = f"Oylik ({s['worked_days_payout']} kun ishladi)"
-        res = archive_worker_salary(code, note=note_str)
+        amount_to_pay = max(0, s["full_payout_balance"])
+        res = archive_worker_salary(code, paid_now=amount_to_pay)
         if res:
-            name, paid, tg_id = res
+            name, paid, next_carry, tg_id, w_days = res
             await query.answer(
-                f"✅ {name} ({paid:,} so'm) arxivga o'tkazildi!",
+                f"✅ {name} ({paid:,} so'm) to'liq yopildi!",
                 show_alert=True,
             )
-            await notify_worker(
-                context,
-                tg_id,
-                f"🎉 **Oyligingiz tarqatildi!**\n"
-                f"📅 Ishlangan vaqt: {s['worked_days_payout']} kun\n"
-                f"💵 Qo'lingizga berilgan yakuniy summa: **{paid:,} so'm**\n"
-                f"✅ Oldingi avans va xarajatlaringiz yopildi.",
-            )
+            await send_payout_notification(context, name, paid, next_carry, tg_id, w_days)
 
         kb = build_payout_workers_keyboard()
         await query.edit_message_text(
-            "💸 **Oylik berilgan ishchini tanlang:**\n_(Qolgan ishchilar ro'yxati)_",
+            "💸 **Oylik tarqatish:**\n_(Qolgan ishchilar ro'yxati)_",
             parse_mode="Markdown",
             reply_markup=kb,
         )
+        return ConversationHandler.END
+
+    if data.startswith("pay_part_"):
+        code = data.replace("pay_part_", "")
+        s = get_worker_summary(code)
+        context.user_data["partial_pay_code"] = code
+        bal = s["full_payout_balance"]
+        bal_info = (
+            f"Jami sof balansi: **+{bal:,} so'm**"
+            if bal >= 0
+            else f"Joriy qarzi: **-{abs(bal):,} so'm**"
+        )
+        await query.edit_message_text(
+            f"💰 **Qisman berish / Jamg'arish**\n"
+            f"👤 Xodim: **{s['name']}**\n"
+            f"📊 {bal_info}\n\n"
+            f"Xodimning qo'liga berilgan summani faqat raqamda kiriting\n"
+            f"_(Qolgan qismi yoki qarzi avtomatik keyingi oyga o'tadi. Agar qarz bo'lsa va pul berilmasa `0` yuboring)_:",
+            parse_mode="Markdown",
+        )
+        return PARTIAL_PAY_AMOUNT
+
+    return ConversationHandler.END
 
 
+async def finish_partial_payout(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    text = update.message.text.strip().replace(" ", "")
+    if not text.isdigit():
+        await update.message.reply_text("Faqat raqam kiriting (masalan: 1500000 yoki 0):")
+        return PARTIAL_PAY_AMOUNT
+
+    paid_now = int(text)
+    code = context.user_data.get("partial_pay_code")
+    res = archive_worker_salary(code, paid_now=paid_now)
+    if res:
+        name, paid, next_carry, tg_id, w_days = res
+        await send_payout_notification(context, name, paid, next_carry, tg_id, w_days)
+
+        if next_carry > 0:
+            status_line = f"📦 Keyingi oyga jamg'arma o'tdi: **+{next_carry:,} so'm**"
+        elif next_carry < 0:
+            status_line = f"⚠️ Keyingi oyga qarz o'tdi: **-{abs(next_carry):,} so'm**"
+        else:
+            status_line = "✅ Keyingi oyga o'tadigan qoldiq: **0 so'm**"
+
+        await update.message.reply_text(
+            f"✅ **{name}** uchun oy hisobi yopildi!\n"
+            f"💵 Qo'liga berildi: **{paid:,} so'm**\n"
+            f"{status_line}",
+            parse_mode="Markdown",
+            reply_markup=get_admin_menu(),
+        )
+    return ConversationHandler.END
+
+
+# --- ARXIV VA EXCEL EXPORT ---
 async def show_archive_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if update.effective_user.id != ADMIN_ID:
         return
@@ -1024,9 +1131,11 @@ async def handle_archive_view(update: Update, context: ContextTypes.DEFAULT_TYPE
                 "Davr (Oy)",
                 "Xodim Ismi",
                 "100% Stavka",
+                "O'tgan Qoldiq",
                 "Bonus",
                 "Olingan Avans",
                 "Qo'liga Berildi",
+                "Keyingi Oyga O'tdi",
                 "Izoh",
                 "Sana",
             ]
@@ -1037,9 +1146,11 @@ async def handle_archive_view(update: Update, context: ContextTypes.DEFAULT_TYPE
                     item.get("period_month", ""),
                     item.get("worker_name", ""),
                     item.get("base_salary", 0),
+                    item.get("prev_carryover", 0),
                     item.get("total_bonus", 0),
                     item.get("total_taken", 0),
                     item.get("paid_amount", 0),
+                    item.get("next_carryover", 0),
                     item.get("note", ""),
                     item.get("paid_date", ""),
                 ]
@@ -1135,11 +1246,17 @@ async def list_workers(update: Update, context: ContextTypes.DEFAULT_TYPE):
         bal = s["current_balance"]
         status_icon = "⏸" if is_paused else "🟢"
         tg_badge = "🔔" if tg_id else "🔕"
-        holat = f"Qoldiq: {bal:,}" if bal >= 0 else f"Qarz: {abs(bal):,}"
+        holat = f"Jami qoldiq: {bal:,}" if bal >= 0 else f"Jami qarz: {abs(bal):,}"
+        carry_txt = ""
+        if s["carryover_balance"] > 0:
+            carry_txt = f" | 📦 Jamg'arma: +{s['carryover_balance']:,}"
+        elif s["carryover_balance"] < 0:
+            carry_txt = f" | ⚠️ O'tgan qarz: -{abs(s['carryover_balance']):,}"
+
         msg += (
             f"{status_icon} **{name}** {tg_badge} | ID: `{code}`\n"
             f"   Boshlagan: `{s['start_date']}` | Ishladi: {s['worked_days_cur']} kun (Pauza: {s['paused_days_cur']} kun)\n"
-            f"   Stavka: {salary:,} | Yig'ildi ({s['percent_cur']}%): {s['earned_salary_cur']:,}\n"
+            f"   Stavka: {salary:,} | Yig'ildi ({s['percent_cur']}%): {s['earned_salary_cur']:,}{carry_txt}\n"
             f"   Olgan: {s['total_taken']:,} | 👉 {holat} so'm\n\n"
         )
 
@@ -1168,6 +1285,10 @@ def build_application():
             ),
             MessageHandler(
                 filters.Regex("^🔍 Hisobimni tekshirish$"), check_worker_stats
+            ),
+            CallbackQueryHandler(
+                handle_payout_callbacks,
+                pattern="^(confirm_payout|cancel_payout|pay_full_|pay_part_)",
             ),
         ],
         states={
@@ -1213,6 +1334,11 @@ def build_application():
                     filters.TEXT & ~filters.COMMAND, check_worker_stats
                 )
             ],
+            PARTIAL_PAY_AMOUNT: [
+                MessageHandler(
+                    filters.TEXT & ~filters.COMMAND, finish_partial_payout
+                )
+            ],
         },
         fallbacks=[CommandHandler("start", start)],
         allow_reentry=True,
@@ -1238,12 +1364,6 @@ def build_application():
     app.add_handler(
         CallbackQueryHandler(
             handle_pause_callback, pattern="^(toggle_pause_|pause_close)"
-        )
-    )
-    app.add_handler(
-        CallbackQueryHandler(
-            handle_payout_callbacks,
-            pattern="^(confirm_payout|cancel_payout|pay_one_)",
         )
     )
     app.add_handler(
