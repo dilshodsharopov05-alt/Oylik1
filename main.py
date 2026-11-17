@@ -1,12 +1,13 @@
 import asyncio
 import calendar
-import csv
 import io
 import logging
 import os
 import random
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 from aiohttp import web
+import openpyxl
+from openpyxl.styles import Alignment, Font, PatternFill
 import requests
 from telegram import (
     InlineKeyboardButton,
@@ -32,11 +33,19 @@ logging.basicConfig(
 )
 
 # --- SOZLAMALAR ---
-TELEGRAM_TOKEN = os.environ.get("BOT_TOKEN", "9119787790:AAHxlNGWuDqdxmOc5478GxMt-XxGx0yWOCI")
+# Token endi kod ichida yozilmaydi, faqat Render Environment Variables'dan olinadi!
+TELEGRAM_TOKEN = os.environ.get("BOT_TOKEN")
 PORT = int(os.environ.get("PORT", 8080))
-ADMIN_IDS = [1264738478, 7090331311]  # 1-Admin (Dilshodbek) va 2-Admin (Anvar)
+ADMIN_IDS = [1264738478, 7090331311]  # Dilshodbek va Anvar
 FIREBASE_URL = "https://ishchilar-oyligi-default-rtdb.asia-southeast1.firebasedatabase.app"
 WEBAPP_URL = "https://dilshodsharopov05-alt.github.io/Oylik-bot/"
+
+# Toshkent vaqt mintaqasi (UTC+5)
+UZ_TZ = timezone(timedelta(hours=5))
+
+
+def now_uz():
+    return datetime.now(UZ_TZ).replace(tzinfo=None)
 
 
 # --- FIREBASE REALTIME DATABASE FUNKSIYALARI ---
@@ -95,7 +104,7 @@ def generate_unique_id():
 
 def add_worker(name, salary):
     code = generate_unique_id()
-    today_str = datetime.now().strftime("%Y-%m-%d")
+    today_str = now_uz().strftime("%Y-%m-%d")
     worker_data = {
         "name": name,
         "id_code": code,
@@ -157,7 +166,7 @@ def toggle_worker_pause(id_code):
     is_paused = bool(w.get("is_paused", False))
     tg_user_id = w.get("tg_user_id")
     pauses = w.get("pauses") or []
-    today_str = datetime.now().strftime("%Y-%m-%d")
+    today_str = now_uz().strftime("%Y-%m-%d")
 
     if not is_paused:
         pauses.append({"paused_at": today_str, "resumed_at": None})
@@ -175,7 +184,7 @@ def toggle_worker_pause(id_code):
 
 
 def add_transaction(id_code, amount, t_type, note=""):
-    now_str = datetime.now().strftime("%Y-%m-%d %H:%M")
+    now_str = now_uz().strftime("%Y-%m-%d %H:%M")
     fb_post(
         "reports",
         {
@@ -231,7 +240,7 @@ def calculate_worked_days(start_date_str, pauses, period_start, period_end):
 
 
 def get_payout_period_info():
-    now = datetime.now()
+    now = now_uz()
     if now.day <= 15:
         year = now.year if now.month > 1 else now.year - 1
         month = now.month - 1 if now.month > 1 else 12
@@ -278,7 +287,7 @@ def get_worker_summary(id_code):
             )
     transactions.sort(key=lambda x: x[3], reverse=True)
 
-    now = datetime.now()
+    now = now_uz()
     days_in_cur_month = calendar.monthrange(now.year, now.month)[1]
     cur_month_start = datetime(now.year, now.month, 1).date()
     today_date = now.date()
@@ -336,7 +345,7 @@ def archive_worker_salary(id_code, paid_now):
 
     next_carryover = summary["full_payout_balance"] - paid_now
     period, _, _, _ = get_payout_period_info()
-    now_str = datetime.now().strftime("%Y-%m-%d %H:%M")
+    now_str = now_uz().strftime("%Y-%m-%d %H:%M")
 
     note_text = f"Oylik ({summary['worked_days_payout']} kun ishladi)"
     if next_carryover > 0:
@@ -397,6 +406,12 @@ async def notify_worker(context: ContextTypes.DEFAULT_TYPE, tg_id, text):
     PARTIAL_PAY_AMOUNT,
 ) = range(9)
 
+ADMIN_MENU_REGEX = (
+    "^(➕ Ishchi qo'shish|🗑 Ishchini o'chirish|💸 Pul berish \\(Avans/Bonus\\)|"
+    "✏️ Stavkani tahrirlash|⏸ Pauza / Ishga qaytarish|📋 Ishchilar ro'yxati|"
+    "💰 Oylik tarqatish|📂 Arxiv)$"
+)
+
 
 def get_admin_menu():
     buttons = [
@@ -433,8 +448,9 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         workers = get_all_workers()
         active_cnt = sum(1 for w in workers if not w[4])
         paused_cnt = sum(1 for w in workers if w[4])
+        today_str = now_uz().strftime("%Y-%m-%d")
         await update.message.reply_text(
-            f"👨‍💼 **Administrator oynasi (Render 24/7)**\n"
+            f"👨‍💼 **Administrator oynasi** (`{today_str}`)\n"
             f"🟢 Ishlayotganlar: {active_cnt} ta | ⏸ Pauzada: {paused_cnt} ta\n\n"
             f"Kerakli bo'limni tanlang:",
             parse_mode="Markdown",
@@ -622,11 +638,11 @@ def build_pause_keyboard():
 
 async def pause_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if update.effective_user.id not in ADMIN_IDS:
-        return
+        return ConversationHandler.END
     workers = get_all_workers()
     if not workers:
-        await update.message.reply_text("Hozircha ishchilar ro'yxati bo'sh.")
-        return
+        await update.message.reply_text("Hozircha ishchilar ro'yxati bo'sh.", reply_markup=get_admin_menu())
+        return ConversationHandler.END
 
     active_list = [w[0] for w in workers if not w[4]]
     paused_list = [w[0] for w in workers if w[4]]
@@ -640,6 +656,7 @@ async def pause_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(
         msg, parse_mode="Markdown", reply_markup=build_pause_keyboard()
     )
+    return ConversationHandler.END
 
 
 async def handle_pause_callback(
@@ -871,14 +888,14 @@ async def distribute_salary_menu(
     update: Update, context: ContextTypes.DEFAULT_TYPE
 ):
     if update.effective_user.id not in ADMIN_IDS:
-        return
+        return ConversationHandler.END
     workers = get_all_workers()
     if not workers:
-        await update.message.reply_text("Hozircha ishchilar ro'yxati bo'sh.")
-        return
+        await update.message.reply_text("Hozircha ishchilar ro'yxati bo'sh.", reply_markup=get_admin_menu())
+        return ConversationHandler.END
 
     period, _, _, days_in_p = get_payout_period_info()
-    today_str = datetime.now().strftime("%Y-%m-%d")
+    today_str = now_uz().strftime("%Y-%m-%d")
     msg = (
         f"📊 **OYLIK TARQATISH HISOBOTI**\n"
         f"🗓 Davr: `{period}` ({days_in_p} kunlik oy)\n"
@@ -926,6 +943,7 @@ async def distribute_salary_menu(
         ]
     )
     await update.message.reply_text(msg, parse_mode="Markdown", reply_markup=kb)
+    return ConversationHandler.END
 
 
 def build_payout_workers_keyboard():
@@ -1072,15 +1090,15 @@ async def finish_partial_payout(update: Update, context: ContextTypes.DEFAULT_TY
     return ConversationHandler.END
 
 
-# --- ARXIV VA EXCEL EXPORT ---
+# --- ARXIV VA HAQIQIY EXCEL (.XLSX) EXPORT ---
 async def show_archive_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if update.effective_user.id not in ADMIN_IDS:
-        return
+        return ConversationHandler.END
 
     all_arch = get_archive_all()
     if not all_arch:
-        await update.message.reply_text("📂 Arxiv hozircha bo'sh.")
-        return
+        await update.message.reply_text("📂 Arxiv hozircha bo'sh.", reply_markup=get_admin_menu())
+        return ConversationHandler.END
 
     grouped = {}
     for item in all_arch:
@@ -1102,8 +1120,8 @@ async def show_archive_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
     buttons.append(
         [
             InlineKeyboardButton(
-                "📥 Barcha arxivni Excel (CSV) yuklash",
-                callback_data="arch_export_csv",
+                "📥 Barcha arxivni Excel (.xlsx) yuklash",
+                callback_data="arch_export_excel",
             )
         ]
     )
@@ -1113,6 +1131,7 @@ async def show_archive_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
         parse_mode="Markdown",
         reply_markup=InlineKeyboardMarkup(buttons),
     )
+    return ConversationHandler.END
 
 
 async def handle_archive_view(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -1123,44 +1142,67 @@ async def handle_archive_view(update: Update, context: ContextTypes.DEFAULT_TYPE
 
     all_arch = get_archive_all()
 
-    if query.data == "arch_export_csv":
-        output = io.StringIO()
-        writer = csv.writer(output)
-        writer.writerow(
-            [
-                "Davr (Oy)",
-                "Xodim Ismi",
-                "100% Stavka",
-                "O'tgan Qoldiq",
-                "Bonus",
-                "Olingan Avans",
-                "Qo'liga Berildi",
-                "Keyingi Oyga O'tdi",
-                "Izoh",
-                "Sana",
-            ]
-        )
+    if query.data == "arch_export_excel":
+        wb = openpyxl.Workbook()
+        ws = wb.active
+        ws.title = "Oyliklar Arxivi"
+
+        headers = [
+            "Davr (Oy)",
+            "Xodim Ismi",
+            "100% Stavka",
+            "O'tgan Qoldiq",
+            "Bonus",
+            "Olingan Avans",
+            "Qo'liga Berildi",
+            "Keyingi Oyga O'tdi",
+            "Izoh",
+            "Sana",
+        ]
+        ws.append(headers)
+
+        header_fill = PatternFill(start_color="1D4ED8", end_color="1D4ED8", fill_type="solid")
+        header_font = Font(bold=True, color="FFFFFF")
+
+        for cell in ws[1]:
+            cell.fill = header_fill
+            cell.font = header_font
+            cell.alignment = Alignment(horizontal="center", vertical="center")
+
         for item in all_arch:
-            writer.writerow(
+            ws.append(
                 [
                     item.get("period_month", ""),
                     item.get("worker_name", ""),
-                    item.get("base_salary", 0),
-                    item.get("prev_carryover", 0),
-                    item.get("total_bonus", 0),
-                    item.get("total_taken", 0),
-                    item.get("paid_amount", 0),
-                    item.get("next_carryover", 0),
+                    int(item.get("base_salary", 0)),
+                    int(item.get("prev_carryover", 0)),
+                    int(item.get("total_bonus", 0)),
+                    int(item.get("total_taken", 0)),
+                    int(item.get("paid_amount", 0)),
+                    int(item.get("next_carryover", 0)),
                     item.get("note", ""),
                     item.get("paid_date", ""),
                 ]
             )
 
-        bio = io.BytesIO(output.getvalue().encode("utf-8-sig"))
-        bio.name = f"Oylik_Arxiv_{datetime.now().strftime('%Y_%m_%d')}.csv"
+        for col in ws.columns:
+            max_len = 0
+            col_letter = col[0].column_letter
+            for cell in col:
+                val_len = len(str(cell.value or ""))
+                if val_len > max_len:
+                    max_len = val_len
+            ws.column_dimensions[col_letter].width = max_len + 4
+
+        bio = io.BytesIO()
+        wb.save(bio)
+        bio.seek(0)
+        file_name = f"Oylik_Arxiv_{now_uz().strftime('%Y_%m_%d')}.xlsx"
+
         await query.message.reply_document(
             document=bio,
-            caption="📊 Barcha oylik hisobotlar jadvali (Excelda ochiladi).",
+            filename=file_name,
+            caption="📊 Barcha oylik hisobotlar jadvali (Excel .xlsx).",
         )
         return
 
@@ -1185,8 +1227,8 @@ async def handle_archive_view(update: Update, context: ContextTypes.DEFAULT_TYPE
         buttons.append(
             [
                 InlineKeyboardButton(
-                    "📥 Barcha arxivni Excel (CSV) yuklash",
-                    callback_data="arch_export_csv",
+                    "📥 Barcha arxivni Excel (.xlsx) yuklash",
+                    callback_data="arch_export_excel",
                 )
             ]
         )
@@ -1234,13 +1276,14 @@ async def handle_archive_view(update: Update, context: ContextTypes.DEFAULT_TYPE
 
 async def list_workers(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if update.effective_user.id not in ADMIN_IDS:
-        return
+        return ConversationHandler.END
     workers = get_all_workers()
     if not workers:
-        await update.message.reply_text("Hozircha ishchilar ro'yxati bo'sh.")
-        return
+        await update.message.reply_text("Hozircha ishchilar ro'yxati bo'sh.", reply_markup=get_admin_menu())
+        return ConversationHandler.END
 
-    msg = "📋 **Ishchilar ro'yxati (Render Live):**\n\n"
+    today_str = now_uz().strftime("%Y-%m-%d")
+    msg = f"📋 **Ishchilar ro'yxati (`{today_str}`):**\n\n"
     for name, code, salary, _, is_paused, tg_id in workers:
         s = get_worker_summary(code)
         bal = s["current_balance"]
@@ -1260,32 +1303,38 @@ async def list_workers(update: Update, context: ContextTypes.DEFAULT_TYPE):
             f"   Olgan: {s['total_taken']:,} | 👉 {holat} so'm\n\n"
         )
 
-    await update.message.reply_text(msg, parse_mode="Markdown")
+    await update.message.reply_text(msg, parse_mode="Markdown", reply_markup=get_admin_menu())
+    return ConversationHandler.END
 
 
 # --- APPLICATION YARATISH ---
 def build_application():
+    if not TELEGRAM_TOKEN:
+        raise ValueError("BOT_TOKEN environment variable topilmadi!")
+
     app = Application.builder().token(TELEGRAM_TOKEN).build()
+
+    # Menyu tugmalari istalgan jarayonni uzib, darhol yangi bo'limga o'tishi uchun fallbacks
+    menu_fallbacks = [
+        CommandHandler("start", start),
+        MessageHandler(filters.Regex("^➕ Ishchi qo'shish$"), start_add_worker),
+        MessageHandler(filters.Regex("^🗑 Ishchini o'chirish$"), start_del_worker),
+        MessageHandler(filters.Regex("^💸 Pul berish \\(Avans/Bonus\\)$"), start_transaction),
+        MessageHandler(filters.Regex("^✏️ Stavkani tahrirlash$"), start_edit_salary),
+        MessageHandler(filters.Regex("^⏸ Pauza / Ishga qaytarish$"), pause_menu),
+        MessageHandler(filters.Regex("^📋 Ishchilar ro'yxati$"), list_workers),
+        MessageHandler(filters.Regex("^💰 Oylik tarqatish$"), distribute_salary_menu),
+        MessageHandler(filters.Regex("^📂 Arxiv$"), show_archive_menu),
+    ]
 
     conv_handler = ConversationHandler(
         entry_points=[
             CommandHandler("start", start),
-            MessageHandler(
-                filters.Regex("^➕ Ishchi qo'shish$"), start_add_worker
-            ),
-            MessageHandler(
-                filters.Regex("^🗑 Ishchini o'chirish$"), start_del_worker
-            ),
-            MessageHandler(
-                filters.Regex("^💸 Pul berish \\(Avans/Bonus\\)$"),
-                start_transaction,
-            ),
-            MessageHandler(
-                filters.Regex("^✏️ Stavkani tahrirlash$"), start_edit_salary
-            ),
-            MessageHandler(
-                filters.Regex("^🔍 Hisobimni tekshirish$"), check_worker_stats
-            ),
+            MessageHandler(filters.Regex("^➕ Ishchi qo'shish$"), start_add_worker),
+            MessageHandler(filters.Regex("^🗑 Ishchini o'chirish$"), start_del_worker),
+            MessageHandler(filters.Regex("^💸 Pul berish \\(Avans/Bonus\\)$"), start_transaction),
+            MessageHandler(filters.Regex("^✏️ Stavkani tahrirlash$"), start_edit_salary),
+            MessageHandler(filters.Regex("^🔍 Hisobimni tekshirish$"), check_worker_stats),
             CallbackQueryHandler(
                 handle_payout_callbacks,
                 pattern="^(confirm_payout|cancel_payout|pay_full_|pay_part_)",
@@ -1293,85 +1342,55 @@ def build_application():
         ],
         states={
             ADD_NAME: [
-                MessageHandler(filters.TEXT & ~filters.COMMAND, get_worker_name)
+                MessageHandler(filters.TEXT & ~filters.COMMAND & ~filters.Regex(ADMIN_MENU_REGEX), get_worker_name)
             ],
             ADD_SALARY: [
-                MessageHandler(
-                    filters.TEXT & ~filters.COMMAND, get_worker_salary
-                )
+                MessageHandler(filters.TEXT & ~filters.COMMAND & ~filters.Regex(ADMIN_MENU_REGEX), get_worker_salary)
             ],
             DEL_ID: [
-                MessageHandler(
-                    filters.TEXT & ~filters.COMMAND, finish_del_worker
-                )
+                MessageHandler(filters.TEXT & ~filters.COMMAND & ~filters.Regex(ADMIN_MENU_REGEX), finish_del_worker)
             ],
             TRANS_TYPE: [
-                CallbackQueryHandler(
-                    tr_worker_selected, pattern="^tr_(sel_|cancel)"
-                ),
-                MessageHandler(filters.TEXT & ~filters.COMMAND, get_trans_type),
+                CallbackQueryHandler(tr_worker_selected, pattern="^tr_(sel_|cancel)"),
+                MessageHandler(filters.TEXT & ~filters.COMMAND & ~filters.Regex(ADMIN_MENU_REGEX), get_trans_type),
             ],
             TRANS_AMOUNT: [
-                MessageHandler(
-                    filters.TEXT & ~filters.COMMAND, get_trans_amount
-                )
+                MessageHandler(filters.TEXT & ~filters.COMMAND & ~filters.Regex(ADMIN_MENU_REGEX), get_trans_amount)
             ],
             TRANS_NOTE: [
-                MessageHandler(
-                    filters.TEXT & ~filters.COMMAND, finish_transaction
-                )
+                MessageHandler(filters.TEXT & ~filters.COMMAND & ~filters.Regex(ADMIN_MENU_REGEX), finish_transaction)
             ],
             EDIT_SAL_AMOUNT: [
-                CallbackQueryHandler(
-                    edit_salary_selected, pattern="^editsal_"
-                ),
-                MessageHandler(
-                    filters.TEXT & ~filters.COMMAND, finish_edit_salary
-                ),
+                CallbackQueryHandler(edit_salary_selected, pattern="^editsal_"),
+                MessageHandler(filters.TEXT & ~filters.COMMAND & ~filters.Regex(ADMIN_MENU_REGEX), finish_edit_salary),
             ],
             WORKER_CHECK_ID: [
-                MessageHandler(
-                    filters.TEXT & ~filters.COMMAND, check_worker_stats
-                )
+                MessageHandler(filters.TEXT & ~filters.COMMAND, check_worker_stats)
             ],
             PARTIAL_PAY_AMOUNT: [
-                MessageHandler(
-                    filters.TEXT & ~filters.COMMAND, finish_partial_payout
-                )
+                MessageHandler(filters.TEXT & ~filters.COMMAND & ~filters.Regex(ADMIN_MENU_REGEX), finish_partial_payout)
             ],
         },
-        fallbacks=[CommandHandler("start", start)],
+        fallbacks=menu_fallbacks,
         allow_reentry=True,
     )
 
-    app.add_handler(conv_handler)
     app.add_handler(
-        MessageHandler(
-            filters.Regex("^⏸ Pauza / Ishga qaytarish$"), pause_menu
+        CallbackQueryHandler(
+            handle_archive_view,
+            pattern="^(arch_view_|arch_back|arch_export_excel)$",
         )
-    )
-    app.add_handler(
-        MessageHandler(filters.Regex("^📋 Ishchilar ro'yxati$"), list_workers)
-    )
-    app.add_handler(
-        MessageHandler(
-            filters.Regex("^💰 Oylik tarqatish$"), distribute_salary_menu
-        )
-    )
-    app.add_handler(
-        MessageHandler(filters.Regex("^📂 Arxiv$"), show_archive_menu)
     )
     app.add_handler(
         CallbackQueryHandler(
             handle_pause_callback, pattern="^(toggle_pause_|pause_close)"
         )
     )
-    app.add_handler(
-        CallbackQueryHandler(
-            handle_archive_view,
-            pattern="^(arch_view_|arch_back|arch_export_csv)$",
-        )
-    )
+    app.add_handler(conv_handler)
+    app.add_handler(MessageHandler(filters.Regex("^⏸ Pauza / Ishga qaytarish$"), pause_menu))
+    app.add_handler(MessageHandler(filters.Regex("^📋 Ishchilar ro'yxati$"), list_workers))
+    app.add_handler(MessageHandler(filters.Regex("^💰 Oylik tarqatish$"), distribute_salary_menu))
+    app.add_handler(MessageHandler(filters.Regex("^📂 Arxiv$"), show_archive_menu))
     return app
 
 
