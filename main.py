@@ -13,6 +13,7 @@ from telegram import (
     InlineKeyboardButton,
     InlineKeyboardMarkup,
     KeyboardButton,
+    MenuButtonDefault,
     ReplyKeyboardMarkup,
     Update,
     WebAppInfo,
@@ -33,10 +34,9 @@ logging.basicConfig(
 )
 
 # --- SOZLAMALAR ---
-# Token endi kod ichida yozilmaydi, faqat Render Environment Variables'dan olinadi!
 TELEGRAM_TOKEN = os.environ.get("BOT_TOKEN")
 PORT = int(os.environ.get("PORT", 8080))
-ADMIN_IDS = [1264738478, 7090331311]  # Dilshodbek va Anvar
+ADMIN_IDS = [1264738478, 7090331311]  # 1-Admin (Dilshodbek) va 2-Admin (Anvar)
 FIREBASE_URL = "https://ishchilar-oyligi-default-rtdb.asia-southeast1.firebasedatabase.app"
 WEBAPP_URL = "https://dilshodsharopov05-alt.github.io/Oylik-bot/"
 
@@ -444,6 +444,16 @@ def format_carryover_line(carry):
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = update.effective_user.id
+
+    # Eski 'Kassa POS' tugmasini ushbu chat uchun majburiy o'chirish
+    try:
+        await context.bot.set_chat_menu_button(
+            chat_id=update.effective_chat.id,
+            menu_button=MenuButtonDefault(),
+        )
+    except Exception as e:
+        logging.warning(f"Menu button tozalashda xato: {e}")
+
     if user_id in ADMIN_IDS:
         workers = get_all_workers()
         active_cnt = sum(1 for w in workers if not w[4])
@@ -1314,7 +1324,6 @@ def build_application():
 
     app = Application.builder().token(TELEGRAM_TOKEN).build()
 
-    # Menyu tugmalari istalgan jarayonni uzib, darhol yangi bo'limga o'tishi uchun fallbacks
     menu_fallbacks = [
         CommandHandler("start", start),
         MessageHandler(filters.Regex("^➕ Ishchi qo'shish$"), start_add_worker),
@@ -1414,6 +1423,11 @@ async def run_bot_and_server():
     await bot_app.initialize()
     await bot_app.start()
     await bot_app.bot.delete_webhook(drop_pending_updates=True)
+    # Global menyu tugmasini ham tozalash
+    try:
+        await bot_app.bot.set_chat_menu_button(menu_button=MenuButtonDefault())
+    except Exception:
+        pass
     await bot_app.updater.start_polling(allowed_updates=Update.ALL_TYPES)
     logging.info("Telegram bot polling rejimida ishga tushdi!")
 
