@@ -36,16 +36,33 @@ logging.basicConfig(
 # --- SOZLAMALAR ---
 TELEGRAM_TOKEN = os.environ.get("BOT_TOKEN")
 PORT = int(os.environ.get("PORT", 8080))
-ADMIN_IDS = [1264738478, 7090331311]  # 1-Admin (Dilshodbek) va 2-Admin (Anvar)
+
+ADMIN_NAMES = {
+    1264738478: "Dilshodbek",
+    7090331311: "Anvar",
+    7035014220: "Abbos",
+}
+ALL_ADMIN_IDS = list(ADMIN_NAMES.keys())
+
+BRANCH_LABELS = {
+    "labzak": "Labzak",
+    "qoraqamish": "Qoraqamish",
+}
+
 FIREBASE_URL = "https://ishchilar-oyligi-default-rtdb.asia-southeast1.firebasedatabase.app"
 WEBAPP_URL = "https://dilshodsharopov05-alt.github.io/Oylik-bot/"
 
-# Toshkent vaqt mintaqasi (UTC+5)
 UZ_TZ = timezone(timedelta(hours=5))
 
 
 def now_uz():
     return datetime.now(UZ_TZ).replace(tzinfo=None)
+
+
+def get_user_branch(user_id, context: ContextTypes.DEFAULT_TYPE):
+    if "active_branch" not in context.user_data:
+        context.user_data["active_branch"] = "qoraqamish" if user_id == 7035014220 else "labzak"
+    return context.user_data["active_branch"]
 
 
 # --- FIREBASE REALTIME DATABASE FUNKSIYALARI ---
@@ -102,16 +119,19 @@ def generate_unique_id():
             return code
 
 
-def add_worker(name, salary):
+def add_worker(name, salary, branch="labzak"):
     code = generate_unique_id()
     today_str = now_uz().strftime("%Y-%m-%d")
     worker_data = {
         "name": name,
         "id_code": code,
+        "branch": branch,
         "salary": salary,
         "carryover_balance": 0,
         "start_date": today_str,
         "is_paused": False,
+        "is_paid_current": False,
+        "last_paid_amount": 0,
         "tg_user_id": None,
         "pauses": [],
     }
@@ -127,27 +147,31 @@ def bind_worker_telegram(id_code, tg_user_id):
     fb_patch(f"workers/{id_code}", {"tg_user_id": tg_user_id})
 
 
-def get_all_workers():
+def get_workers_by_branch(branch):
     data = fb_get("workers") or {}
     result = []
     for code, w in data.items():
         if isinstance(w, dict):
-            result.append(
-                (
-                    w.get("name", "Nomsiz"),
-                    code,
-                    int(w.get("salary", 0)),
-                    w.get("start_date"),
-                    bool(w.get("is_paused", False)),
-                    w.get("tg_user_id"),
+            w_branch = w.get("branch") or "labzak"
+            if w_branch == branch:
+                result.append(
+                    (
+                        w.get("name", "Nomsiz"),
+                        code,
+                        int(w.get("salary", 0)),
+                        w.get("start_date"),
+                        bool(w.get("is_paused", False)),
+                        w.get("tg_user_id"),
+                        bool(w.get("is_paid_current", False)),
+                        int(w.get("last_paid_amount", 0)),
+                    )
                 )
-            )
     return result
 
 
-def delete_worker(id_code):
+def delete_worker(id_code, allowed_branch):
     w = fb_get(f"workers/{id_code}")
-    if not w:
+    if not w or (w.get("branch") or "labzak") != allowed_branch:
         return False
     fb_delete(f"workers/{id_code}")
     reports = fb_get("reports") or {}
@@ -183,12 +207,13 @@ def toggle_worker_pause(id_code):
     return name, new_state, today_str, tg_user_id
 
 
-def add_transaction(id_code, amount, t_type, note=""):
+def add_transaction(id_code, amount, t_type, note="", branch="labzak"):
     now_str = now_uz().strftime("%Y-%m-%d %H:%M")
     fb_post(
         "reports",
         {
             "worker_id_code": id_code,
+            "branch": branch,
             "amount": amount,
             "type": t_type,
             "note": note,
@@ -239,32 +264,18 @@ def calculate_worked_days(start_date_str, pauses, period_start, period_end):
     return worked_days, paused_days
 
 
-def get_payout_period_info():
-    now = now_uz()
-    if now.day <= 15:
-        year = now.year if now.month > 1 else now.year - 1
-        month = now.month - 1 if now.month > 1 else 12
-    else:
-        year = now.year
-        month = now.month
-
-    days_in_period = calendar.monthrange(year, month)[1]
-    p_start = datetime(year, month, 1).date()
-    p_end = datetime(year, month, days_in_period).date()
-    label = f"{year}-{month:02d}"
-    return label, p_start, p_end, days_in_period
-
-
 def get_worker_summary(id_code):
     w = fb_get(f"workers/{id_code}")
     if not w or not isinstance(w, dict):
         return None
 
     name = w.get("name", "Nomsiz")
+    branch = w.get("branch") or "labzak"
     base_salary = int(w.get("salary", 0))
     carryover_balance = int(w.get("carryover_balance", 0))
     start_date_str = w.get("start_date")
     is_paused = bool(w.get("is_paused", False))
+    is_paid_current = bool(w.get("is_paid_current", False))
     tg_user_id = w.get("tg_user_id")
     pauses = w.get("pauses") or []
 
@@ -292,6 +303,7 @@ def get_worker_summary(id_code):
     cur_month_start = datetime(now.year, now.month, 1).date()
     today_date = now.date()
 
+    # Shu kungacha ishlagan kunlari va yig'gan puli
     worked_days_cur, paused_days_cur = calculate_worked_days(
         start_date_str, pauses, cur_month_start, today_date
     )
@@ -300,40 +312,28 @@ def get_worker_summary(id_code):
         (base_salary / days_in_cur_month) * worked_days_cur
     )
 
-    _, p_start, p_end, days_in_period = get_payout_period_info()
-    worked_days_payout, paused_days_payout = calculate_worked_days(
-        start_date_str, pauses, p_start, p_end
-    )
-    payout_earned_salary = round(
-        (base_salary / days_in_period) * worked_days_payout
-    )
-
     total_taken = sum(t[0] for t in transactions if t[1] == "avans")
     total_bonus = sum(t[0] for t in transactions if t[1] == "bonus")
 
     current_balance = (carryover_balance + earned_salary_cur + total_bonus) - total_taken
-    full_payout_balance = (carryover_balance + payout_earned_salary + total_bonus) - total_taken
 
     return {
         "name": name,
+        "branch": branch,
         "base_salary": base_salary,
         "carryover_balance": carryover_balance,
         "start_date": start_date_str or cur_month_start.strftime("%Y-%m-%d"),
         "is_paused": is_paused,
+        "is_paid_current": is_paid_current,
         "tg_user_id": tg_user_id,
         "worked_days_cur": worked_days_cur,
         "paused_days_cur": paused_days_cur,
         "days_in_cur_month": days_in_cur_month,
         "percent_cur": percent_cur,
         "earned_salary_cur": earned_salary_cur,
-        "worked_days_payout": worked_days_payout,
-        "paused_days_payout": paused_days_payout,
-        "days_in_period": days_in_period,
-        "payout_earned_salary": payout_earned_salary,
         "total_taken": total_taken,
         "total_bonus": total_bonus,
         "current_balance": current_balance,
-        "full_payout_balance": full_payout_balance,
         "transactions": transactions,
     }
 
@@ -343,11 +343,13 @@ def archive_worker_salary(id_code, paid_now):
     if not summary:
         return None
 
-    next_carryover = summary["full_payout_balance"] - paid_now
-    period, _, _, _ = get_payout_period_info()
-    now_str = now_uz().strftime("%Y-%m-%d %H:%M")
+    next_carryover = summary["current_balance"] - paid_now
+    now = now_uz()
+    period = f"{now.year}-{now.month:02d}"
+    today_str = now.strftime("%Y-%m-%d")
+    now_str = now.strftime("%Y-%m-%d %H:%M")
 
-    note_text = f"Oylik ({summary['worked_days_payout']} kun ishladi)"
+    note_text = f"Oylik ({summary['worked_days_cur']} kun ishladi — {today_str} gacha)"
     if next_carryover > 0:
         note_text += f" | Jamg'armaga o'tdi: +{next_carryover:,}"
     elif next_carryover < 0:
@@ -358,6 +360,7 @@ def archive_worker_salary(id_code, paid_now):
         {
             "worker_id_code": id_code,
             "worker_name": summary["name"],
+            "branch": summary["branch"],
             "base_salary": summary["base_salary"],
             "prev_carryover": summary["carryover_balance"],
             "total_bonus": summary["total_bonus"],
@@ -373,14 +376,42 @@ def archive_worker_salary(id_code, paid_now):
     for _, _, _, _, r_key in summary["transactions"]:
         fb_patch(f"reports/{r_key}", {"is_archived": True})
 
-    fb_patch(f"workers/{id_code}", {"carryover_balance": next_carryover})
+    fb_patch(
+        f"workers/{id_code}",
+        {
+            "carryover_balance": next_carryover,
+            "is_paid_current": True,
+            "last_paid_amount": paid_now,
+        },
+    )
 
-    return summary["name"], paid_now, next_carryover, summary["tg_user_id"], summary["worked_days_payout"]
+    return summary["name"], paid_now, next_carryover, summary["tg_user_id"], summary["worked_days_cur"]
 
 
-def get_archive_all():
+def reset_new_month_for_branch(branch):
+    today_str = now_uz().strftime("%Y-%m-%d")
+    workers = get_workers_by_branch(branch)
+    for _, code, _, _, is_paused, _, _, _ in workers:
+        new_pauses = [{"paused_at": today_str, "resumed_at": None}] if is_paused else []
+        fb_patch(
+            f"workers/{code}",
+            {
+                "is_paid_current": False,
+                "last_paid_amount": 0,
+                "start_date": today_str,
+                "pauses": new_pauses,
+            },
+        )
+    return today_str, len(workers)
+
+
+def get_archive_by_branch(branch):
     data = fb_get("salary_archive") or {}
-    return [item for _, item in data.items() if isinstance(item, dict)]
+    return [
+        item
+        for _, item in data.items()
+        if isinstance(item, dict) and (item.get("branch") or "labzak") == branch
+    ]
 
 
 async def notify_worker(context: ContextTypes.DEFAULT_TYPE, tg_id, text):
@@ -409,18 +440,20 @@ async def notify_worker(context: ContextTypes.DEFAULT_TYPE, tg_id, text):
 ADMIN_MENU_REGEX = (
     "^(➕ Ishchi qo'shish|🗑 Ishchini o'chirish|💸 Pul berish \\(Avans/Bonus\\)|"
     "✏️ Stavkani tahrirlash|⏸ Pauza / Ishga qaytarish|📋 Ishchilar ro'yxati|"
-    "💰 Oylik tarqatish|📂 Arxiv)$"
+    "💰 Oylik tarqatish|📂 Arxiv|🏢 Filial: Labzak|🏢 Filial: Qoraqamish)"
 )
 
 
-def get_admin_menu():
+def get_admin_menu(branch):
+    next_label = "Qoraqamish" if branch == "labzak" else "Labzak"
     buttons = [
         [
             KeyboardButton(
-                text="🌐 WebApp Ilovani ochish (Real-Time)",
+                text=f"🌐 WebApp ({BRANCH_LABELS[branch]})",
                 web_app=WebAppInfo(url=WEBAPP_URL),
             )
         ],
+        [f"🏢 Filial: {BRANCH_LABELS[branch]} (Almashtirish -> {next_label})"],
         ["➕ Ishchi qo'shish", "🗑 Ishchini o'chirish"],
         ["💸 Pul berish (Avans/Bonus)", "✏️ Stavkani tahrirlash"],
         ["⏸ Pauza / Ishga qaytarish", "📋 Ishchilar ro'yxati"],
@@ -445,26 +478,29 @@ def format_carryover_line(carry):
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = update.effective_user.id
 
-    # Eski 'Kassa POS' tugmasini ushbu chat uchun majburiy o'chirish
     try:
         await context.bot.set_chat_menu_button(
             chat_id=update.effective_chat.id,
             menu_button=MenuButtonDefault(),
         )
-    except Exception as e:
-        logging.warning(f"Menu button tozalashda xato: {e}")
+    except Exception:
+        pass
 
-    if user_id in ADMIN_IDS:
-        workers = get_all_workers()
+    if user_id in ALL_ADMIN_IDS:
+        branch = get_user_branch(user_id, context)
+        workers = get_workers_by_branch(branch)
         active_cnt = sum(1 for w in workers if not w[4])
         paused_cnt = sum(1 for w in workers if w[4])
         today_str = now_uz().strftime("%Y-%m-%d")
+        admin_name = ADMIN_NAMES[user_id]
+
         await update.message.reply_text(
-            f"👨‍💼 **Administrator oynasi** (`{today_str}`)\n"
+            f"👨‍💼 **Bosh Administrator: {admin_name}** (`{today_str}`)\n"
+            f"🏢 Faol filial: **{BRANCH_LABELS[branch]}**\n"
             f"🟢 Ishlayotganlar: {active_cnt} ta | ⏸ Pauzada: {paused_cnt} ta\n\n"
             f"Kerakli bo'limni tanlang:",
             parse_mode="Markdown",
-            reply_markup=get_admin_menu(),
+            reply_markup=get_admin_menu(branch),
         )
     else:
         await update.message.reply_text(
@@ -474,6 +510,28 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
             reply_markup=WORKER_MENU,
         )
         return WORKER_CHECK_ID
+    return ConversationHandler.END
+
+
+async def switch_branch_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user_id = update.effective_user.id
+    if user_id not in ALL_ADMIN_IDS:
+        return ConversationHandler.END
+
+    cur = get_user_branch(user_id, context)
+    new_branch = "qoraqamish" if cur == "labzak" else "labzak"
+    context.user_data["active_branch"] = new_branch
+
+    workers = get_workers_by_branch(new_branch)
+    active_cnt = sum(1 for w in workers if not w[4])
+    paused_cnt = sum(1 for w in workers if w[4])
+
+    await update.message.reply_text(
+        f"🔄 Filial o'zgartirildi: **{BRANCH_LABELS[new_branch]}**\n"
+        f"🟢 Ishlayotganlar: {active_cnt} ta | ⏸ Pauzada: {paused_cnt} ta",
+        parse_mode="Markdown",
+        reply_markup=get_admin_menu(new_branch),
+    )
     return ConversationHandler.END
 
 
@@ -520,7 +578,7 @@ async def check_worker_stats(update: Update, context: ContextTypes.DEFAULT_TYPE)
     carry_line = format_carryover_line(data["carryover_balance"])
 
     msg += (
-        f"👤 **Xodim:** {data['name']}\n"
+        f"👤 **Xodim:** {data['name']} (🏢 {BRANCH_LABELS[data['branch']]})\n"
         f"📌 **Holati:** {holat_badge}\n"
         f"📅 **Ish boshlagan sana:** `{data['start_date']}`\n"
         f"💰 **1 oylik stavka (100%):** {data['base_salary']:,} so'm\n"
@@ -548,11 +606,13 @@ async def check_worker_stats(update: Update, context: ContextTypes.DEFAULT_TYPE)
 
 
 async def start_edit_salary(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if update.effective_user.id not in ADMIN_IDS:
+    user_id = update.effective_user.id
+    if user_id not in ALL_ADMIN_IDS:
         return ConversationHandler.END
-    workers = get_all_workers()
+    branch = get_user_branch(user_id, context)
+    workers = get_workers_by_branch(branch)
     if not workers:
-        await update.message.reply_text("Hozircha ishchilar ro'yxati bo'sh.")
+        await update.message.reply_text(f"{BRANCH_LABELS[branch]} filialida ishchilar yo'q.")
         return ConversationHandler.END
 
     buttons = [
@@ -562,14 +622,14 @@ async def start_edit_salary(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 callback_data=f"editsal_{code}",
             )
         ]
-        for name, code, salary, _, _, _ in workers
+        for name, code, salary, _, _, _, _, _ in workers
     ]
     buttons.append(
         [InlineKeyboardButton("❌ Bekor qilish", callback_data="editsal_cancel")]
     )
 
     await update.message.reply_text(
-        "✏️ **Stavkani tahrirlash**\nQaysi ishchining oylik maoshini o'zgartirmoqchisiz?",
+        f"✏️ **Stavkani tahrirlash ({BRANCH_LABELS[branch]})**\nQaysi ishchining oylik maoshini o'zgartirmoqchisiz?",
         parse_mode="Markdown",
         reply_markup=InlineKeyboardMarkup(buttons),
     )
@@ -599,6 +659,8 @@ async def edit_salary_selected(
 
 
 async def finish_edit_salary(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user_id = update.effective_user.id
+    branch = get_user_branch(user_id, context)
     text = update.message.text.strip().replace(" ", "")
     if not text.isdigit():
         await update.message.reply_text("Faqat raqam kiriting:")
@@ -618,15 +680,15 @@ async def finish_edit_salary(update: Update, context: ContextTypes.DEFAULT_TYPE)
     await update.message.reply_text(
         f"✅ **{worker['name']}** ning yangi oylik stavkasi **{new_sal:,} so'm** etib saqlandi!",
         parse_mode="Markdown",
-        reply_markup=get_admin_menu(),
+        reply_markup=get_admin_menu(branch),
     )
     return ConversationHandler.END
 
 
-def build_pause_keyboard():
-    workers = get_all_workers()
+def build_pause_keyboard(branch):
+    workers = get_workers_by_branch(branch)
     buttons = []
-    for name, code, _, _, is_paused, _ in workers:
+    for name, code, _, _, is_paused, _, _, _ in workers:
         icon = (
             "⏸ Pauzada (Ishga qaytarish)"
             if is_paused
@@ -647,24 +709,29 @@ def build_pause_keyboard():
 
 
 async def pause_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if update.effective_user.id not in ADMIN_IDS:
+    user_id = update.effective_user.id
+    if user_id not in ALL_ADMIN_IDS:
         return ConversationHandler.END
-    workers = get_all_workers()
+    branch = get_user_branch(user_id, context)
+    workers = get_workers_by_branch(branch)
     if not workers:
-        await update.message.reply_text("Hozircha ishchilar ro'yxati bo'sh.", reply_markup=get_admin_menu())
+        await update.message.reply_text(
+            f"{BRANCH_LABELS[branch]} filialida ishchilar yo'q.",
+            reply_markup=get_admin_menu(branch),
+        )
         return ConversationHandler.END
 
     active_list = [w[0] for w in workers if not w[4]]
     paused_list = [w[0] for w in workers if w[4]]
 
     msg = (
-        f"⏸ **ISHCHILAR HOLATI VA PAUZA BOSHQARUVI**\n\n"
+        f"⏸ **PAUZA BOSHQARUVI ({BRANCH_LABELS[branch]})**\n\n"
         f"🟢 **Ishlayotganlar ({len(active_list)}):** {', '.join(active_list) if active_list else 'Yo`q'}\n"
         f"⏸ **Pauzadagilar ({len(paused_list)}):** {', '.join(paused_list) if paused_list else 'Yo`q'}\n\n"
         f"Holatini o'zgartirish uchun ishchining ustiga bosing:"
     )
     await update.message.reply_text(
-        msg, parse_mode="Markdown", reply_markup=build_pause_keyboard()
+        msg, parse_mode="Markdown", reply_markup=build_pause_keyboard(branch)
     )
     return ConversationHandler.END
 
@@ -673,7 +740,8 @@ async def handle_pause_callback(
     update: Update, context: ContextTypes.DEFAULT_TYPE
 ):
     query = update.callback_query
-    if query.from_user.id not in ADMIN_IDS:
+    user_id = query.from_user.id
+    if user_id not in ALL_ADMIN_IDS:
         return
     await query.answer()
 
@@ -681,6 +749,7 @@ async def handle_pause_callback(
         await query.edit_message_text("✅ Pauza boshqaruvi oynasi yopildi.")
         return
 
+    branch = get_user_branch(user_id, context)
     if query.data.startswith("toggle_pause_"):
         code = query.data.replace("toggle_pause_", "")
         res = toggle_worker_pause(code)
@@ -705,24 +774,29 @@ async def handle_pause_callback(
                     f"🟢 **Siz yana ishga qaytarildingiz ({t_date})**\nBugundan boshlab kunlik oylik hisoblanishi davom etadi.",
                 )
 
-        workers = get_all_workers()
+        workers = get_workers_by_branch(branch)
         active_list = [w[0] for w in workers if not w[4]]
         paused_list = [w[0] for w in workers if w[4]]
         msg = (
-            f"⏸ **ISHCHILAR HOLATI VA PAUZA BOSHQARUVI**\n\n"
+            f"⏸ **PAUZA BOSHQARUVI ({BRANCH_LABELS[branch]})**\n\n"
             f"🟢 **Ishlayotganlar ({len(active_list)}):** {', '.join(active_list) if active_list else 'Yo`q'}\n"
             f"⏸ **Pauzadagilar ({len(paused_list)}):** {', '.join(paused_list) if paused_list else 'Yo`q'}\n\n"
             f"Holatini o'zgartirish uchun ishchining ustiga bosing:"
         )
         await query.edit_message_text(
-            msg, parse_mode="Markdown", reply_markup=build_pause_keyboard()
+            msg, parse_mode="Markdown", reply_markup=build_pause_keyboard(branch)
         )
 
 
 async def start_add_worker(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if update.effective_user.id not in ADMIN_IDS:
+    user_id = update.effective_user.id
+    if user_id not in ALL_ADMIN_IDS:
         return ConversationHandler.END
-    await update.message.reply_text("Yangi ishchining ism-familiyasini kiriting:")
+    branch = get_user_branch(user_id, context)
+    await update.message.reply_text(
+        f"🏢 **{BRANCH_LABELS[branch]}** filiali uchun yangi ishchining ism-familiyasini kiriting:",
+        parse_mode="Markdown",
+    )
     return ADD_NAME
 
 
@@ -735,6 +809,8 @@ async def get_worker_name(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 async def get_worker_salary(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user_id = update.effective_user.id
+    branch = get_user_branch(user_id, context)
     text = update.message.text.strip().replace(" ", "")
     if not text.isdigit():
         await update.message.reply_text("Faqat raqam kiriting:")
@@ -742,50 +818,60 @@ async def get_worker_salary(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     name = context.user_data["new_name"]
     salary = int(text)
-    id_code, start_d = add_worker(name, salary)
+    id_code, start_d = add_worker(name, salary, branch=branch)
 
     await update.message.reply_text(
         f"✅ **Ishchi qo'shildi!**\n\n"
+        f"🏢 Filial: **{BRANCH_LABELS[branch]}**\n"
         f"👤 Ismi: {name}\n"
         f"📅 Ish boshlagan sana: `{start_d}`\n"
         f"💰 100% Oyligi: {salary:,} so'm\n"
         f"🔑 ID kodi: `{id_code}`",
         parse_mode="Markdown",
-        reply_markup=get_admin_menu(),
+        reply_markup=get_admin_menu(branch),
     )
     return ConversationHandler.END
 
 
 async def start_del_worker(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if update.effective_user.id not in ADMIN_IDS:
+    user_id = update.effective_user.id
+    if user_id not in ALL_ADMIN_IDS:
         return ConversationHandler.END
+    branch = get_user_branch(user_id, context)
     await update.message.reply_text(
-        "O'chirmoqchi bo'lgan ishchining 7 xonali ID kodini kiriting:"
+        f"🏢 **{BRANCH_LABELS[branch]}** filialidan o'chirmoqchi bo'lgan ishchining 7 xonali ID kodini kiriting:",
+        parse_mode="Markdown",
     )
     return DEL_ID
 
 
 async def finish_del_worker(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user_id = update.effective_user.id
+    branch = get_user_branch(user_id, context)
     code = update.message.text.strip()
-    if delete_worker(code):
+    if delete_worker(code, allowed_branch=branch):
         await update.message.reply_text(
             f"🗑 ID `{code}` egasi o'chirildi.",
             parse_mode="Markdown",
-            reply_markup=get_admin_menu(),
+            reply_markup=get_admin_menu(branch),
         )
     else:
         await update.message.reply_text(
-            "❌ Bunday ID topilmadi.", reply_markup=get_admin_menu()
+            f"❌ Ushbu ID **{BRANCH_LABELS[branch]}** filialida topilmadi.",
+            parse_mode="Markdown",
+            reply_markup=get_admin_menu(branch),
         )
     return ConversationHandler.END
 
 
 async def start_transaction(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if update.effective_user.id not in ADMIN_IDS:
+    user_id = update.effective_user.id
+    if user_id not in ALL_ADMIN_IDS:
         return ConversationHandler.END
-    workers = get_all_workers()
+    branch = get_user_branch(user_id, context)
+    workers = get_workers_by_branch(branch)
     if not workers:
-        await update.message.reply_text("Hozircha ishchilar ro'yxati bo'sh.")
+        await update.message.reply_text(f"{BRANCH_LABELS[branch]} filialida ishchilar yo'q.")
         return ConversationHandler.END
 
     buttons = [
@@ -794,13 +880,13 @@ async def start_transaction(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 f"👤 {name} ({code})", callback_data=f"tr_sel_{code}"
             )
         ]
-        for name, code, _, _, _, _ in workers
+        for name, code, _, _, _, _, _, _ in workers
     ]
     buttons.append(
         [InlineKeyboardButton("❌ Bekor qilish", callback_data="tr_cancel")]
     )
     await update.message.reply_text(
-        "💸 **Pul berish / Bonus**\nXodimni tanlang:",
+        f"💸 **Pul berish / Bonus ({BRANCH_LABELS[branch]})**\nXodimni tanlang:",
         parse_mode="Markdown",
         reply_markup=InlineKeyboardMarkup(buttons),
     )
@@ -819,12 +905,14 @@ async def tr_worker_selected(update: Update, context: ContextTypes.DEFAULT_TYPE)
     worker = get_worker_summary(code)
     context.user_data["trans_id"] = code
     context.user_data["trans_name"] = worker["name"]
+    context.user_data["trans_branch"] = worker["branch"]
 
     kb = ReplyKeyboardMarkup(
         [["Avans (Xarajat)", "Bonus"]], resize_keyboard=True
     )
     await query.edit_message_text(
-        f"👤 Tanlandi: **{worker['name']}**", parse_mode="Markdown"
+        f"👤 Tanlandi: **{worker['name']}** ({BRANCH_LABELS[worker['branch']]})",
+        parse_mode="Markdown",
     )
     await query.message.reply_text("Amaliyot turini tanlang:", reply_markup=kb)
     return TRANS_TYPE
@@ -859,16 +947,19 @@ async def get_trans_amount(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 async def finish_transaction(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user_id = update.effective_user.id
+    branch = get_user_branch(user_id, context)
     note = update.message.text.strip()
     if note == "-":
         note = ""
 
     code = context.user_data["trans_id"]
     name = context.user_data["trans_name"]
+    w_branch = context.user_data.get("trans_branch", branch)
     t_type = context.user_data["trans_type"]
     amount = context.user_data["trans_amount"]
 
-    add_transaction(code, amount, t_type, note)
+    add_transaction(code, amount, t_type, note, branch=w_branch)
     updated_summary = get_worker_summary(code)
 
     label_uz = "Avans (Xarajat)" if t_type == "avans" else "Bonus"
@@ -877,7 +968,7 @@ async def finish_transaction(update: Update, context: ContextTypes.DEFAULT_TYPE)
     await notify_worker(
         context,
         updated_summary["tg_user_id"],
-        f"💳 **Hisobingizda yangi amaliyot!**\n"
+        f"💳 **Hisobingizda yangi amaliyot!** ({BRANCH_LABELS[w_branch]})\n"
         f"📌 Turi: **{label_uz}**\n"
         f"💵 Summa: **{amount:,} so'm**{note_line}\n"
         f"━━━━━━━━━━━━━━\n"
@@ -888,34 +979,61 @@ async def finish_transaction(update: Update, context: ContextTypes.DEFAULT_TYPE)
         f"✅ **Saqlandi va xodimga xabar yuborildi!**\n"
         f"👤 {name} (`{code}`)\n📌 {label_uz}: {amount:,} so'm{note_line}",
         parse_mode="Markdown",
-        reply_markup=get_admin_menu(),
+        reply_markup=get_admin_menu(branch),
     )
     return ConversationHandler.END
 
 
-# --- OYLIK TARQATISH (TO'LIQ YOKI QISMAN/JAMG'ARMA/QARZ BILAN) ---
+# --- OYLIK TARQATISH (SHU KUNGACHA ISHLAGAN PULI + HAR OYNING 1-SANASI) ---
 async def distribute_salary_menu(
     update: Update, context: ContextTypes.DEFAULT_TYPE
 ):
-    if update.effective_user.id not in ADMIN_IDS:
+    user_id = update.effective_user.id
+    if user_id not in ALL_ADMIN_IDS:
         return ConversationHandler.END
-    workers = get_all_workers()
+    branch = get_user_branch(user_id, context)
+    workers = get_workers_by_branch(branch)
     if not workers:
-        await update.message.reply_text("Hozircha ishchilar ro'yxati bo'sh.", reply_markup=get_admin_menu())
+        await update.message.reply_text(
+            f"{BRANCH_LABELS[branch]} filialida ishchilar yo'q.",
+            reply_markup=get_admin_menu(branch),
+        )
         return ConversationHandler.END
 
-    period, _, _, days_in_p = get_payout_period_info()
-    today_str = now_uz().strftime("%Y-%m-%d")
+    total_spent = sum(w[7] for w in workers if w[6])
+    unpaid_workers = [w for w in workers if not w[6]]
+    if not unpaid_workers:
+        kb = InlineKeyboardMarkup(
+            [
+                [
+                    InlineKeyboardButton(
+                        "🔄 Yangi oyni boshlash",
+                        callback_data="start_new_month",
+                    )
+                ]
+            ]
+        )
+        await update.message.reply_text(
+            f"🎉 **{BRANCH_LABELS[branch]} filialida barcha {len(workers)} ta xodimga oylik tarqatildi!**\n"
+            f"💰 Oylikda jami ketgan pul: **{total_spent:,} so'm**\n\n"
+            f"Keyingi oy hisob-kitobini ochish uchun quyidagi tugmani bosing:",
+            parse_mode="Markdown",
+            reply_markup=kb,
+        )
+        return ConversationHandler.END
+
+    now = now_uz()
+    today_str = now.strftime("%Y-%m-%d")
     msg = (
-        f"📊 **OYLIK TARQATISH HISOBOTI**\n"
-        f"🗓 Davr: `{period}` ({days_in_p} kunlik oy)\n"
-        f"💸 Xarajatlar: `{today_str}` gacha barcha olingan pullar\n\n"
+        f"📊 **OYLIK TARQATISH ({BRANCH_LABELS[branch]})**\n"
+        f"📅 **Har oyning 1-sanasida oylik berish** (`{today_str}` gacha)\n"
+        f"👥 Oylik olmaganlar: **{len(unpaid_workers)}/{len(workers)} kishi**\n\n"
     )
     total_payout = 0
 
-    for name, code, salary, _, _, _ in workers:
+    for idx, (name, code, salary, _, _, _, _, _) in enumerate(unpaid_workers, 1):
         s = get_worker_summary(code)
-        bal = s["full_payout_balance"]
+        bal = s["current_balance"]
         if bal > 0:
             total_payout += bal
 
@@ -926,25 +1044,25 @@ async def distribute_salary_menu(
             carry_str = f" | O'tgan qarz: -{abs(s['carryover_balance']):,}"
 
         holat = (
-            f"✅ Jami sof balans: +{bal:,} so'm"
+            f"✅ Shu kungacha sof balans: +{bal:,} so'm"
             if bal >= 0
             else f"⚠️ Qarzi bor: -{abs(bal):,} so'm"
         )
         msg += (
-            f"👤 **{name}** (`{code}`)\n"
-            f"   Ishladi: {s['worked_days_payout']}/{days_in_p} kun (Pauza: {s['paused_days_payout']} kun)\n"
-            f"   Hisoblandi: {s['payout_earned_salary']:,} | Bonus: {s['total_bonus']:,} | Olgan: {s['total_taken']:,}{carry_str}\n"
+            f"{idx}. 👤 **{name}** (`{code}`) — _Har oyning 1-sanasida oylik berish_\n"
+            f"   Shu kungacha ishladi: {s['worked_days_cur']} kun (Pauza: {s['paused_days_cur']} kun)\n"
+            f"   Yig'ildi: {s['earned_salary_cur']:,} | Bonus: {s['total_bonus']:,} | Olgan: {s['total_taken']:,}{carry_str}\n"
             f"   👉 {holat}\n\n"
         )
 
-    msg += f"━━━━━━━━━━━━━━\n💰 **Jami ijobiy balans:** {total_payout:,} so'm\n\n"
-    msg += "Hisobotni tasdiqlaysizmi?"
+    msg += f"━━━━━━━━━━━━━━\n💰 **Shu kungacha beriladigan jami:** {total_payout:,} so'm\n\n"
+    msg += "Tarqatishni boshlaysizmi?"
 
     kb = InlineKeyboardMarkup(
         [
             [
                 InlineKeyboardButton(
-                    "✅ Tasdiqlash", callback_data="confirm_payout"
+                    "✅ Tarqatishni boshlash", callback_data="confirm_payout"
                 ),
                 InlineKeyboardButton(
                     "❌ Bekor qilish", callback_data="cancel_payout"
@@ -956,17 +1074,18 @@ async def distribute_salary_menu(
     return ConversationHandler.END
 
 
-def build_payout_workers_keyboard():
-    workers = get_all_workers()
+def build_payout_workers_keyboard(branch):
+    workers = get_workers_by_branch(branch)
+    unpaid = [w for w in workers if not w[6]]
     buttons = []
-    for name, code, _, _, _, _ in workers:
+    for idx, (name, code, _, _, _, _, _, _) in enumerate(unpaid, 1):
         s = get_worker_summary(code)
-        bal = s["full_payout_balance"]
+        bal = s["current_balance"]
         row = []
         if bal > 0:
             row.append(
                 InlineKeyboardButton(
-                    f"💵 {name} ({bal:,}) — To'liq",
+                    f"💵 {idx}. {name} — To'liq (shu kungacha: {bal:,})",
                     callback_data=f"pay_full_{code}",
                 )
             )
@@ -980,7 +1099,7 @@ def build_payout_workers_keyboard():
     buttons.append(
         [InlineKeyboardButton("🔙 Yopish", callback_data="cancel_payout")]
     )
-    return InlineKeyboardMarkup(buttons)
+    return InlineKeyboardMarkup(buttons), len(unpaid), len(workers)
 
 
 async def send_payout_notification(context, name, paid_now, next_carryover, tg_id, worked_days):
@@ -989,13 +1108,13 @@ async def send_payout_notification(context, name, paid_now, next_carryover, tg_i
     elif next_carryover < 0:
         extra_msg = f"⚠️ **Keyingi oyga o'tgan qarz:** -{abs(next_carryover):,} so'm"
     else:
-        extra_msg = "✅ Oy hisobi 0 balans bilan to'liq yopildi."
+        extra_msg = "✅ Hisob 0 balans bilan yopildi."
 
     await notify_worker(
         context,
         tg_id,
         f"🎉 **Oylik hisob-kitobi yopildi!**\n"
-        f"📅 Ishlangan vaqt: {worked_days} kun\n"
+        f"📅 Har oyning 1-sanasida oylik berish (Ishlangan: {worked_days} kun)\n"
         f"💵 Qo'lingizga berilgan summa: **{paid_now:,} so'm**\n"
         f"{extra_msg}",
     )
@@ -1005,9 +1124,11 @@ async def handle_payout_callbacks(
     update: Update, context: ContextTypes.DEFAULT_TYPE
 ):
     query = update.callback_query
-    if query.from_user.id not in ADMIN_IDS:
+    user_id = query.from_user.id
+    if user_id not in ALL_ADMIN_IDS:
         return ConversationHandler.END
 
+    branch = get_user_branch(user_id, context)
     await query.answer()
     data = query.data
 
@@ -1015,12 +1136,23 @@ async def handle_payout_callbacks(
         await query.edit_message_text("❌ Oylik tarqatish oynasi yopildi.")
         return ConversationHandler.END
 
-    if data == "confirm_payout":
-        kb = build_payout_workers_keyboard()
+    if data == "start_new_month":
+        today_str, total_cnt = reset_new_month_for_branch(branch)
         await query.edit_message_text(
-            "💸 **Oylik tarqatish:**\n"
-            "• **To'liq** — barcha puli beriladi (qoldiq: 0)\n"
-            "• **Qisman / Jamg'arma** — qo'liga berilgan summani yozasiz, qolgani (yoki qarzi) keyingi oyga o'tadi:",
+            f"🔄 **{BRANCH_LABELS[branch]} filiali uchun YANGI OY boshlandi!**\n"
+            f"📅 Yangi hisob sanasi: `{today_str}`\n"
+            f"👥 Faollashtirilgan xodimlar: **{total_cnt} ta**\n\n"
+            f"_(Barcha jamg'arma va qarz qoldiqlari saqlanib qoldi)._",
+            parse_mode="Markdown",
+        )
+        return ConversationHandler.END
+
+    if data == "confirm_payout":
+        kb, rem_cnt, tot_cnt = build_payout_workers_keyboard(branch)
+        await query.edit_message_text(
+            f"💸 **Oylik tarqatish ({BRANCH_LABELS[branch]}):**\n"
+            f"📅 _Har oyning 1-sanasida oylik berish_\n"
+            f"Oylik olgan bola ro'yxatdan chiqib ketadi (Qoldi: **{rem_cnt}/{tot_cnt}**):",
             parse_mode="Markdown",
             reply_markup=kb,
         )
@@ -1029,37 +1161,60 @@ async def handle_payout_callbacks(
     if data.startswith("pay_full_"):
         code = data.replace("pay_full_", "")
         s = get_worker_summary(code)
-        amount_to_pay = max(0, s["full_payout_balance"])
+        amount_to_pay = max(0, s["current_balance"])
         res = archive_worker_salary(code, paid_now=amount_to_pay)
         if res:
             name, paid, next_carry, tg_id, w_days = res
             await query.answer(
-                f"✅ {name} ({paid:,} so'm) to'liq yopildi!",
+                f"✅ {name} shu kungacha ishlagan ({paid:,} so'm) pulini oldi!",
                 show_alert=True,
             )
             await send_payout_notification(context, name, paid, next_carry, tg_id, w_days)
 
-        kb = build_payout_workers_keyboard()
-        await query.edit_message_text(
-            "💸 **Oylik tarqatish:**\n_(Qolgan ishchilar ro'yxati)_",
-            parse_mode="Markdown",
-            reply_markup=kb,
-        )
+        kb, rem_cnt, tot_cnt = build_payout_workers_keyboard(branch)
+        if rem_cnt == 0:
+            workers = get_workers_by_branch(branch)
+            total_spent = sum(w[7] for w in workers if w[6])
+            new_month_kb = InlineKeyboardMarkup(
+                [
+                    [
+                        InlineKeyboardButton(
+                            "🔄 Yangi oyni boshlash",
+                            callback_data="start_new_month",
+                        )
+                    ]
+                ]
+            )
+            await query.edit_message_text(
+                f"🎉 **{BRANCH_LABELS[branch]} filialida barcha {tot_cnt} ta xodimga oylik tarqatildi!**\n"
+                f"💰 Oylikda jami ketgan pul: **{total_spent:,} so'm**\n\n"
+                f"Keyingi oy hisob-kitobini ochish uchun tugmani bosing:",
+                parse_mode="Markdown",
+                reply_markup=new_month_kb,
+            )
+        else:
+            await query.edit_message_text(
+                f"💸 **Oylik tarqatish ({BRANCH_LABELS[branch]}):**\n"
+                f"📅 _Har oyning 1-sanasida oylik berish_ (Qolganlar: **{rem_cnt}/{tot_cnt}**)",
+                parse_mode="Markdown",
+                reply_markup=kb,
+            )
         return ConversationHandler.END
 
     if data.startswith("pay_part_"):
         code = data.replace("pay_part_", "")
         s = get_worker_summary(code)
         context.user_data["partial_pay_code"] = code
-        bal = s["full_payout_balance"]
+        bal = s["current_balance"]
         bal_info = (
-            f"Jami sof balansi: **+{bal:,} so'm**"
+            f"Shu kungacha sof balansi: **+{bal:,} so'm** ({s['worked_days_cur']} kun)"
             if bal >= 0
-            else f"Joriy qarzi: **-{abs(bal):,} so'm**"
+            else f"Shu kungacha qarzi: **-{abs(bal):,} so'm**"
         )
         await query.edit_message_text(
             f"💰 **Qisman berish / Jamg'arish**\n"
-            f"👤 Xodim: **{s['name']}**\n"
+            f"👤 Xodim: **{s['name']}** ({BRANCH_LABELS[s['branch']]})\n"
+            f"📅 _Har oyning 1-sanasida oylik berish_\n"
             f"📊 {bal_info}\n\n"
             f"Xodimning qo'liga berilgan summani faqat raqamda kiriting\n"
             f"_(Qolgan qismi yoki qarzi avtomatik keyingi oyga o'tadi. Agar qarz bo'lsa va pul berilmasa `0` yuboring)_:",
@@ -1071,6 +1226,8 @@ async def handle_payout_callbacks(
 
 
 async def finish_partial_payout(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user_id = update.effective_user.id
+    branch = get_user_branch(user_id, context)
     text = update.message.text.strip().replace(" ", "")
     if not text.isdigit():
         await update.message.reply_text("Faqat raqam kiriting (masalan: 1500000 yoki 0):")
@@ -1090,24 +1247,55 @@ async def finish_partial_payout(update: Update, context: ContextTypes.DEFAULT_TY
         else:
             status_line = "✅ Keyingi oyga o'tadigan qoldiq: **0 so'm**"
 
-        await update.message.reply_text(
-            f"✅ **{name}** uchun oy hisobi yopildi!\n"
-            f"💵 Qo'liga berildi: **{paid:,} so'm**\n"
-            f"{status_line}",
-            parse_mode="Markdown",
-            reply_markup=get_admin_menu(),
-        )
+        kb, rem_cnt, tot_cnt = build_payout_workers_keyboard(branch)
+        if rem_cnt == 0:
+            workers = get_workers_by_branch(branch)
+            total_spent = sum(w[7] for w in workers if w[6])
+            new_month_kb = InlineKeyboardMarkup(
+                [
+                    [
+                        InlineKeyboardButton(
+                            "🔄 Yangi oyni boshlash",
+                            callback_data="start_new_month",
+                        )
+                    ]
+                ]
+            )
+            await update.message.reply_text(
+                f"✅ **{name}** oyligini oldi va ro'yxatdan chiqdi!\n"
+                f"💵 Qo'liga berildi: **{paid:,} so'm**\n"
+                f"{status_line}\n\n"
+                f"🎉 **Barcha {tot_cnt} ta xodimga oylik tarqatildi!**\n"
+                f"💰 Oylikda jami ketgan pul: **{total_spent:,} so'm**",
+                parse_mode="Markdown",
+                reply_markup=new_month_kb,
+            )
+        else:
+            await update.message.reply_text(
+                f"✅ **{name}** oyligini oldi va ro'yxatdan chiqdi!\n"
+                f"💵 Qo'liga berildi: **{paid:,} so'm**\n"
+                f"{status_line}\n\n"
+                f"📋 Ro'yxatda qolganlar (**{rem_cnt}/{tot_cnt}**):",
+                parse_mode="Markdown",
+                reply_markup=kb,
+            )
     return ConversationHandler.END
 
 
-# --- ARXIV VA HAQIQIY EXCEL (.XLSX) EXPORT ---
+# --- ARXIV VA EXCEL (.XLSX) EXPORT ---
 async def show_archive_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if update.effective_user.id not in ADMIN_IDS:
+    user_id = update.effective_user.id
+    if user_id not in ALL_ADMIN_IDS:
         return ConversationHandler.END
 
-    all_arch = get_archive_all()
+    branch = get_user_branch(user_id, context)
+    all_arch = get_archive_by_branch(branch)
     if not all_arch:
-        await update.message.reply_text("📂 Arxiv hozircha bo'sh.", reply_markup=get_admin_menu())
+        await update.message.reply_text(
+            f"📂 **{BRANCH_LABELS[branch]}** arxivi hozircha bo'sh.",
+            parse_mode="Markdown",
+            reply_markup=get_admin_menu(branch),
+        )
         return ConversationHandler.END
 
     grouped = {}
@@ -1130,14 +1318,14 @@ async def show_archive_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
     buttons.append(
         [
             InlineKeyboardButton(
-                "📥 Barcha arxivni Excel (.xlsx) yuklash",
+                f"📥 {BRANCH_LABELS[branch]} arxivini Excel (.xlsx) yuklash",
                 callback_data="arch_export_excel",
             )
         ]
     )
 
     await update.message.reply_text(
-        "📂 **OYLIKLAR ARXIVI**\nBatafsil ko'rish uchun oyni tanlang yoki Excel yuklab oling:",
+        f"📂 **OYLIKLAR ARXIVI ({BRANCH_LABELS[branch]})**\nBatafsil ko'rish uchun oyni tanlang yoki Excel yuklab oling:",
         parse_mode="Markdown",
         reply_markup=InlineKeyboardMarkup(buttons),
     )
@@ -1146,18 +1334,21 @@ async def show_archive_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 async def handle_archive_view(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
-    if query.from_user.id not in ADMIN_IDS:
+    user_id = query.from_user.id
+    if user_id not in ALL_ADMIN_IDS:
         return
     await query.answer()
 
-    all_arch = get_archive_all()
+    branch = get_user_branch(user_id, context)
+    all_arch = get_archive_by_branch(branch)
 
     if query.data == "arch_export_excel":
         wb = openpyxl.Workbook()
         ws = wb.active
-        ws.title = "Oyliklar Arxivi"
+        ws.title = f"{BRANCH_LABELS[branch]} Arxiv"
 
         headers = [
+            "Filial",
             "Davr (Oy)",
             "Xodim Ismi",
             "100% Stavka",
@@ -1182,6 +1373,7 @@ async def handle_archive_view(update: Update, context: ContextTypes.DEFAULT_TYPE
         for item in all_arch:
             ws.append(
                 [
+                    BRANCH_LABELS[item.get("branch") or "labzak"],
                     item.get("period_month", ""),
                     item.get("worker_name", ""),
                     int(item.get("base_salary", 0)),
@@ -1207,12 +1399,12 @@ async def handle_archive_view(update: Update, context: ContextTypes.DEFAULT_TYPE
         bio = io.BytesIO()
         wb.save(bio)
         bio.seek(0)
-        file_name = f"Oylik_Arxiv_{now_uz().strftime('%Y_%m_%d')}.xlsx"
+        file_name = f"Oylik_{BRANCH_LABELS[branch]}_{now_uz().strftime('%Y_%m_%d')}.xlsx"
 
         await query.message.reply_document(
             document=bio,
             filename=file_name,
-            caption="📊 Barcha oylik hisobotlar jadvali (Excel .xlsx).",
+            caption=f"📊 {BRANCH_LABELS[branch]} filiali oylik hisobotlar jadvali (Excel .xlsx).",
         )
         return
 
@@ -1237,13 +1429,13 @@ async def handle_archive_view(update: Update, context: ContextTypes.DEFAULT_TYPE
         buttons.append(
             [
                 InlineKeyboardButton(
-                    "📥 Barcha arxivni Excel (.xlsx) yuklash",
+                    f"📥 {BRANCH_LABELS[branch]} arxivini Excel (.xlsx) yuklash",
                     callback_data="arch_export_excel",
                 )
             ]
         )
         await query.edit_message_text(
-            "📂 **OYLIKLAR ARXIVI**\nBatafsil ko'rish uchun kerakli oyni tanlang:",
+            f"📂 **OYLIKLAR ARXIVI ({BRANCH_LABELS[branch]})**\nBatafsil ko'rish uchun kerakli oyni tanlang:",
             parse_mode="Markdown",
             reply_markup=InlineKeyboardMarkup(buttons),
         )
@@ -1256,7 +1448,7 @@ async def handle_archive_view(update: Update, context: ContextTypes.DEFAULT_TYPE
         if (item.get("period_month") or item.get("paid_date", "")[:7]) == period
     ]
 
-    msg = f"📂 **ARXIV HISOBOTI: {period}**\n\n"
+    msg = f"📂 **ARXIV ({BRANCH_LABELS[branch]}): {period}**\n\n"
     grand_total_paid = 0
     grand_total_taken = 0
 
@@ -1285,19 +1477,25 @@ async def handle_archive_view(update: Update, context: ContextTypes.DEFAULT_TYPE
 
 
 async def list_workers(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if update.effective_user.id not in ADMIN_IDS:
+    user_id = update.effective_user.id
+    if user_id not in ALL_ADMIN_IDS:
         return ConversationHandler.END
-    workers = get_all_workers()
+    branch = get_user_branch(user_id, context)
+    workers = get_workers_by_branch(branch)
     if not workers:
-        await update.message.reply_text("Hozircha ishchilar ro'yxati bo'sh.", reply_markup=get_admin_menu())
+        await update.message.reply_text(
+            f"{BRANCH_LABELS[branch]} filialida hozircha ishchilar yo'q.",
+            reply_markup=get_admin_menu(branch),
+        )
         return ConversationHandler.END
 
     today_str = now_uz().strftime("%Y-%m-%d")
-    msg = f"📋 **Ishchilar ro'yxati (`{today_str}`):**\n\n"
-    for name, code, salary, _, is_paused, tg_id in workers:
+    msg = f"📋 **{BRANCH_LABELS[branch]} — Ishchilar ro'yxati (`{today_str}`):**\n\n"
+    for name, code, salary, _, is_paused, tg_id, is_paid_cur, _ in workers:
         s = get_worker_summary(code)
         bal = s["current_balance"]
         status_icon = "⏸" if is_paused else "🟢"
+        paid_tag = " [✅ Oylik olgan]" if is_paid_cur else ""
         tg_badge = "🔔" if tg_id else "🔕"
         holat = f"Jami qoldiq: {bal:,}" if bal >= 0 else f"Jami qarz: {abs(bal):,}"
         carry_txt = ""
@@ -1307,13 +1505,15 @@ async def list_workers(update: Update, context: ContextTypes.DEFAULT_TYPE):
             carry_txt = f" | ⚠️ O'tgan qarz: -{abs(s['carryover_balance']):,}"
 
         msg += (
-            f"{status_icon} **{name}** {tg_badge} | ID: `{code}`\n"
+            f"{status_icon} **{name}**{paid_tag} {tg_badge} | ID: `{code}`\n"
             f"   Boshlagan: `{s['start_date']}` | Ishladi: {s['worked_days_cur']} kun (Pauza: {s['paused_days_cur']} kun)\n"
             f"   Stavka: {salary:,} | Yig'ildi ({s['percent_cur']}%): {s['earned_salary_cur']:,}{carry_txt}\n"
             f"   Olgan: {s['total_taken']:,} | 👉 {holat} so'm\n\n"
         )
 
-    await update.message.reply_text(msg, parse_mode="Markdown", reply_markup=get_admin_menu())
+    await update.message.reply_text(
+        msg, parse_mode="Markdown", reply_markup=get_admin_menu(branch)
+    )
     return ConversationHandler.END
 
 
@@ -1326,6 +1526,7 @@ def build_application():
 
     menu_fallbacks = [
         CommandHandler("start", start),
+        MessageHandler(filters.Regex("^🏢 Filial:"), switch_branch_handler),
         MessageHandler(filters.Regex("^➕ Ishchi qo'shish$"), start_add_worker),
         MessageHandler(filters.Regex("^🗑 Ishchini o'chirish$"), start_del_worker),
         MessageHandler(filters.Regex("^💸 Pul berish \\(Avans/Bonus\\)$"), start_transaction),
@@ -1339,6 +1540,7 @@ def build_application():
     conv_handler = ConversationHandler(
         entry_points=[
             CommandHandler("start", start),
+            MessageHandler(filters.Regex("^🏢 Filial:"), switch_branch_handler),
             MessageHandler(filters.Regex("^➕ Ishchi qo'shish$"), start_add_worker),
             MessageHandler(filters.Regex("^🗑 Ishchini o'chirish$"), start_del_worker),
             MessageHandler(filters.Regex("^💸 Pul berish \\(Avans/Bonus\\)$"), start_transaction),
@@ -1346,7 +1548,7 @@ def build_application():
             MessageHandler(filters.Regex("^🔍 Hisobimni tekshirish$"), check_worker_stats),
             CallbackQueryHandler(
                 handle_payout_callbacks,
-                pattern="^(confirm_payout|cancel_payout|pay_full_|pay_part_)",
+                pattern="^(confirm_payout|cancel_payout|start_new_month|pay_full_|pay_part_)",
             ),
         ],
         states={
@@ -1396,6 +1598,7 @@ def build_application():
         )
     )
     app.add_handler(conv_handler)
+    app.add_handler(MessageHandler(filters.Regex("^🏢 Filial:"), switch_branch_handler))
     app.add_handler(MessageHandler(filters.Regex("^⏸ Pauza / Ishga qaytarish$"), pause_menu))
     app.add_handler(MessageHandler(filters.Regex("^📋 Ishchilar ro'yxati$"), list_workers))
     app.add_handler(MessageHandler(filters.Regex("^💰 Oylik tarqatish$"), distribute_salary_menu))
@@ -1405,7 +1608,7 @@ def build_application():
 
 # --- UPTIMEROBOT UCHUN AIOHTTP VEB-SERVER VA TELEGRAM POLLING ---
 async def health_check(request):
-    return web.Response(text="Ishchilar Nazorati Boti 24/7 online!", status=200)
+    return web.Response(text="Ishchilar Nazorati Boti (Labzak & Qoraqamish) 24/7 online!", status=200)
 
 
 async def run_bot_and_server():
@@ -1423,7 +1626,6 @@ async def run_bot_and_server():
     await bot_app.initialize()
     await bot_app.start()
     await bot_app.bot.delete_webhook(drop_pending_updates=True)
-    # Global menyu tugmasini ham tozalash
     try:
         await bot_app.bot.set_chat_menu_button(menu_button=MenuButtonDefault())
     except Exception:
